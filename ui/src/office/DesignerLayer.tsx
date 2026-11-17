@@ -36,6 +36,24 @@ export function DesignerLayer({ design, onDragging }: { design: OfficeDesign; on
     const z = e.point.z;
     const d = drag.current;
     const { update } = useDesigner.getState();
+    // Diagnostic counter, opt-in only. Without it, "the chair did not move" cannot
+    // be told apart from "onMove never ran": this handler lives on the floor plane,
+    // and a picked item's mesh stops pointer events from reaching it. Exposing the
+    // count makes the difference observable from a real browser instead of inferred.
+    // Off by default, so production behaviour is untouched.
+    if (d && typeof window !== "undefined") {
+      const w = window as unknown as {
+        __DESIGNER_DEBUG?: boolean;
+        __designerStats?: { moves: number; kind: string; lastX: number; lastZ: number };
+      };
+      if (w.__DESIGNER_DEBUG) {
+        w.__designerStats ??= { moves: 0, kind: "", lastX: 0, lastZ: 0 };
+        w.__designerStats.moves += 1;
+        w.__designerStats.kind = d.kind;
+        w.__designerStats.lastX = x;
+        w.__designerStats.lastZ = z;
+      }
+    }
     if (d?.kind === "item") {
       update((dz) => patchItem(dz, d.id, { x: snap(x - d.dx, 0.05), z: snap(z - d.dz, 0.05) }), false);
     } else if (d?.kind === "room") {
