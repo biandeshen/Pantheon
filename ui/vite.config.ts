@@ -23,6 +23,11 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true, // Tauri's devUrl points here
+    // Bind IPv4 loopback explicitly. Without this, Vite binds only `localhost`,
+    // which on Windows resolves to ::1 -- so http://127.0.0.1:1420/ is refused.
+    // The Workbench links to 127.0.0.1:1420 on purpose (local-only contract),
+    // so the two sides must agree. 127.0.0.1 (not 0.0.0.0) keeps it loopback-only.
+    host: "127.0.0.1",
     proxy: { "/api": { target: ENGINE, ws: true, changeOrigin: false } },
   },
   build: { target: "es2022", chunkSizeWarningLimit: 4000 },

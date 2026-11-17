@@ -28,6 +28,16 @@ body {
   color: var(--color-ink);
   font-family: var(--font-sans);
   color-scheme: dark;
+  /* Desktop needs this too, not only the phone breakpoint below.
+     Without it the `h-full` chain is broken at the root: every `flex-1` /
+     `h-[46%]` below has no height to resolve against, so the 3D office Canvas
+     fell back to the HTMLCanvasElement default of 300x150 -- a small box in the
+     corner of a 1280x900 window. Measured on a real windowed Chrome
+     (2026-11-17): canvas attribute 300x150, CSS box 300x150, WebGL drawing
+     buffer 300x150, i.e. the scene was rendering into a postage stamp.
+     Headless runs never caught it because they only asserted `canvas: 1`
+     (existence), never size. */
+  height: 100%;
 }
 
 /* Phones: fill the visible viewport (not behind the browser toolbars), and keep
