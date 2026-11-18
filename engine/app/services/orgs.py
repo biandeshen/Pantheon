@@ -43,6 +43,22 @@ class OrgError(ValueError):
     pass
 
 
+def _validate_office_design(design: Any) -> bool:
+    """Check that a saved office design has the required structure.
+
+    Mirrors the frontend's ``isDesign()`` in ``ui/src/office/design.ts`` so a
+    malformed layout is caught at the API rather than silently persisted and
+    lost on reload when the frontend falls back to ``generateDesign()``.
+    """
+    if not isinstance(design, dict):
+        return False
+    return (design.get("version") == 1
+            and isinstance(design.get("items"), list)
+            and isinstance(design.get("rooms"), list)
+            and isinstance(design.get("width"), (int, float)) and design["width"] > 0
+            and isinstance(design.get("depth"), (int, float)) and design["depth"] > 0)
+
+
 # --- serialization ------------------------------------------------------------------
 
 
@@ -309,7 +325,15 @@ async def update_org(org_id: str, patch: dict[str, Any]) -> Org:
                     merged[key] = await _validate_model(patch["settings"][key], session)
             org.settings = merged
         if "layout" in patch and isinstance(patch["layout"], dict):
-            org.layout = patch["layout"]
+            layout = patch["layout"]
+            if isinstance(layout.get("office"), dict) and not _validate_office_design(layout["office"]):
+                # Strip the invalid office so it isn't persisted silently; the
+                # frontend will fall back to generateDesign() on reload.
+                import logging
+                logging.getLogger("pantheon.orgs").warning(
+                    "update_org: rejected malformed office design in layout for org %s", org_id)
+                layout = {k: v for k, v in layout.items() if k != "office"}
+            org.layout = layout
         await session.commit()
     await bus.publish("org.updated", org_to_dict(org), org_id=org.id)
     if "settings" in patch and "max_concurrent" in (patch.get("settings") or {}):
