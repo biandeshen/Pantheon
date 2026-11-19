@@ -194,20 +194,32 @@ async def claim_next_task(org_id: str, body: dict[str, Any] = Body(default={})) 
 
 
 async def _sole_org_id(session: Any) -> str:
-    """Resolve the single organisation when the caller used a task ref.
+    """Resolve the one *user* organisation, or refuse when there is more than one.
 
-    Pantheon trial runs one org. If that ever stops being true this must take an explicit
-    org, and this helper returning the first row would become a bug -- noted here rather
-    than silently guessing later.
+    This exists only so a caller can name a task by short ref ("T-49") instead of an id on
+    a route that has no org in its path. It must stay a *safe* convenience: with two user
+    organisations, `LIMIT 1` would resolve "T-49" to whichever sorted first and claim a task
+    in an org the caller never named. Two orgs both having a T-49 is the normal case, not a
+    corner case -- task numbers are per-org.
+
+    `kind != 'user'` rows are excluded: Pantheon itself owns a system org (`org_pantheon`)
+    that holds no user tasks, so counting it would make every short ref look ambiguous and
+    break the single-user-org case this exists for.
     """
     from sqlalchemy import select as _select
 
     from app.models import Org as _Org
 
-    row = (await session.execute(_select(_Org.id).limit(1))).first()
-    if row is None:
+    rows = (await session.execute(
+        _select(_Org.id).where(_Org.kind == "user").order_by(_Org.id).limit(2))).all()
+    if not rows:
         raise HTTPException(404, "no organisation")
-    return str(row[0])
+    if len(rows) > 1:
+        raise HTTPException(
+            409,
+            "more than one organisation exists; a short task ref is ambiguous. Use "
+            "/orgs/{org_id}/tasks/claim-next, or pass the task's full id instead of a ref.")
+    return str(rows[0][0])
 
 
 @router.get("/orgs/{org_id}/artifacts")

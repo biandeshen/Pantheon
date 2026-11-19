@@ -197,8 +197,12 @@ async def test_claim_next_empty_queue_is_a_real_204_without_a_body(app_client):
     assert r.status_code == 204, r.text
     assert r.content == b"", f"204 must have an empty body, got {r.content!r}"
 
-async def test_claiming_by_task_ref_works(app_client):
-    """`_sole_org_id` must be awaited; a sync call there would break ref-based claiming."""
+async def test_claiming_by_task_ref_works_with_a_single_org(app_client):
+    """`_sole_org_id` must be awaited; a sync call there would break ref-based claiming.
+
+    Scoped to one org on purpose: with two orgs a bare ref is ambiguous and must be refused
+    (see test_short_ref_is_refused_when_more_than_one_org_exists).
+    """
     org = await make_org(app_client)
     agent = await make_agent(app_client, org["id"], "Ann")
     task = await _task(app_client, org["id"])
@@ -244,3 +248,43 @@ def test_team_core_is_read_by_split():
     offered, _ = loadout.split(_Org(), tools, [], ())
     for name in loadout.TEAM_CORE:
         assert name in offered, f"{name} is in TEAM_CORE but split() did not offer it"
+
+# --- a short ref must never pick an organisation by guessing ---------------------
+# Two orgs routinely both have a "T-1": task numbers are per-org. Resolving a bare ref with
+# LIMIT 1 would claim a task in an org the caller never named. Refusing is always correct.
+
+async def test_short_ref_is_refused_when_more_than_one_org_exists(app_client):
+    org_a = await make_org(app_client, "Alpha")
+    org_b = await make_org(app_client, "Beta")
+    ann = await make_agent(app_client, org_a["id"], "Ann")
+    await make_agent(app_client, org_b["id"], "Bob")
+
+    a_task = await _task(app_client, org_a["id"], "Alpha task")
+    b_task = await _task(app_client, org_b["id"], "Beta task")
+    assert a_task["ref"] == b_task["ref"] == "T-1", "both orgs number their first task T-1"
+
+    r = await app_client.post("/api/v1/tasks/T-1/claim", json={"agentId": ann["id"]})
+    assert r.status_code == 409, (
+        f"an ambiguous short ref must be refused, got {r.status_code}: {r.text}")
+
+    # Neither side may be touched: a refused claim writes nothing anywhere.
+    a_stored = (await rows(Task, Task.id == a_task["id"]))[0]
+    b_stored = (await rows(Task, Task.id == b_task["id"]))[0]
+    assert a_stored.assignee_id is None, "no claim may land in alpha"
+    assert b_stored.assignee_id is None, "no claim may land in beta"
+    a_events = await rows(TaskEvent, TaskEvent.task_id == a_task["id"], TaskEvent.kind == "claimed")
+    b_events = await rows(TaskEvent, TaskEvent.task_id == b_task["id"], TaskEvent.kind == "claimed")
+    assert not a_events and not b_events, "a refused claim must write no event on either side"
+
+async def test_full_id_still_works_when_multiple_orgs_exist(app_client):
+    """The escape hatch the 409 message points at must actually work."""
+    org_a = await make_org(app_client, "Alpha2")
+    org_b = await make_org(app_client, "Beta2")
+    ann = await make_agent(app_client, org_a["id"], "Ann")
+    await make_agent(app_client, org_b["id"], "Bob")
+    a_task = await _task(app_client, org_a["id"], "Alpha task")
+    await _task(app_client, org_b["id"], "Beta task")
+
+    r = await app_client.post(f"/api/v1/tasks/{a_task['id']}/claim", json={"agentId": ann["id"]})
+    assert r.status_code == 200, f"a full task id is unambiguous and must work: {r.text}"
+    assert r.json()["orgId"] == org_a["id"]
