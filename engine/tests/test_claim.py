@@ -206,3 +206,41 @@ async def test_claiming_by_task_ref_works(app_client):
     r = await app_client.post(f"/api/v1/tasks/{task['ref']}/claim", json={"agentId": agent["id"]})
     assert r.status_code == 200, f"claiming by ref must resolve the org: {r.text}"
     assert r.json()["assigneeId"] == agent["id"]
+
+# --- the tool must actually be offered, not merely registered -------------------
+# The bug this pins: claim_task existed and answered over HTTP, so my endpoint tests were
+# green, but `split()` never read TEAM_CORE, so the tool was deferred behind load_tools and
+# agents never saw it. They went to the shell instead. "Registered" and "offered" are
+# different facts and only the second one lets an agent act.
+
+def test_claim_task_is_offered_without_loading_it_first():
+    """In lean mode a coordination tool must be offered, not deferred."""
+    from app.tools import loadout
+
+    class _Org:
+        settings: dict = {}
+
+    tools = {name: object() for name in
+             ["claim_task", "list_tasks", "update_task", "read_file", "write_file",
+              "run_command", "search_files", "list_dir", "spawn_subagent", "todo",
+              "load_tools", "stage_check", "render_preview", "browse_page", "post_message",
+              "create_channel", "list_channels", "get_task", "create_task", "send_message",
+              "update_org", "set_theme"]}
+    offered, deferred = loadout.split(_Org(), tools, [], ())
+    assert "claim_task" in offered, (
+        "claim_task must be offered every turn; deferring it is why agents probed the API "
+        f"instead. offered={offered} deferred={deferred}")
+
+def test_team_core_is_read_by_split():
+    """Guard against TEAM_CORE becoming dead code again."""
+    from app.tools import loadout
+
+    class _Org:
+        settings: dict = {}
+
+    # One tool from TEAM_CORE and enough other tools to stay in lean mode (> LEAN_ABOVE).
+    tools = {name: object() for name in list(loadout.TEAM_CORE)}
+    tools.update({f"filler_{i}": object() for i in range(loadout.LEAN_ABOVE + 5)})
+    offered, _ = loadout.split(_Org(), tools, [], ())
+    for name in loadout.TEAM_CORE:
+        assert name in offered, f"{name} is in TEAM_CORE but split() did not offer it"

@@ -72,7 +72,11 @@ def split(org: Any, tools: dict[str, Any], messages: list[BaseMessage],
     """(offered, deferred) tool names for the next model call."""
     if not lean(org) or len(tools) <= LEAN_ABOVE:
         return sorted(t for t in tools if t != "load_tools"), []
-    keep = (CORE | loaded_in(messages) | set(sticky)
+    # TEAM_CORE is part of `keep`. It was defined but never referenced here, so adding a
+    # tool to it changed nothing -- which is how claim_task ended up registered, tested over
+    # HTTP, and still invisible to the agents that needed it. A constant nothing reads is
+    # worse than no constant: it looks like the fix is in place.
+    keep = (CORE | TEAM_CORE | loaded_in(messages) | set(sticky)
             | {n for n, t in tools.items() if getattr(t, "core", False)})
     offered = sorted(t for t in tools if t in keep)
     deferred = sorted(t for t in tools if t not in keep)
