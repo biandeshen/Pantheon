@@ -120,6 +120,87 @@ async def update_task(task_id: str, body: dict[str, Any] = Body(...)) -> dict[st
     return task_to_dict(t)
 
 
+@router.post("/tasks/{task_id}/claim")
+async def claim_task(task_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Take a task for one agent, atomically.
+
+    `agentId` names the claimant. It is required in practice: claiming is something an
+    agent does for itself, and a claim recorded against the user would defeat the point
+    (the user already assigns work through PATCH). Omitting it is refused rather than
+    silently resolved to the user, so a caller cannot end up believing an agent took work
+    it never took.
+
+    409 means someone else holds it -- a race the caller survives by picking another task,
+    not an error in the request. 404 means it does not exist.
+    """
+    agent_ref = body.get("agentId") or body.get("agent")
+    if not agent_ref:
+        raise HTTPException(400, "agentId is required: claiming is an agent action")
+    async with SessionLocal() as session:
+        t = await session.get(Task, task_id)
+        if t is None:
+            org_id = _sole_org_id(session)
+            t = await tasks.find_task(session, org_id, task_id)
+        else:
+            org_id = t.org_id
+        if t is None:
+            raise HTTPException(404, "task not found")
+        from app.services.tasks import _resolve_person
+
+        agent_id = await _resolve_person(session, org_id, str(agent_ref))
+        if agent_id is None:
+            raise HTTPException(404, f"agent '{agent_ref}' not found")
+
+    try:
+        claimed = await tasks.claim_task(org_id, Sender("agent", agent_id), t.id,
+                                         force=bool(body.get("force")))
+    except tasks.ClaimConflict as e:
+        raise HTTPException(409, str(e)) from None
+    except tasks.TaskError as e:
+        raise HTTPException(400, str(e)) from None
+    return task_to_dict(claimed)
+
+
+@router.post("/orgs/{org_id}/tasks/claim-next")
+async def claim_next_task(org_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Claim the next free task for one agent, or 204 when there is nothing free."""
+    agent_ref = body.get("agentId") or body.get("agent")
+    if not agent_ref:
+        raise HTTPException(400, "agentId is required: claiming is an agent action")
+    async with SessionLocal() as session:
+        from app.services.tasks import _resolve_person
+
+        agent_id = await _resolve_person(session, org_id, str(agent_ref))
+    if agent_id is None:
+        raise HTTPException(404, f"agent '{agent_ref}' not found")
+
+    try:
+        claimed = await tasks.claim_next(org_id, Sender("agent", agent_id),
+                                         label=body.get("label"))
+    except tasks.ClaimConflict as e:
+        raise HTTPException(409, str(e)) from None
+    if claimed is None:
+        raise HTTPException(204, "no claimable task")
+    return task_to_dict(claimed)
+
+
+def _sole_org_id(session: Any) -> str:
+    """Resolve the single organisation when the caller used a task ref.
+
+    Pantheon trial runs one org. If that ever stops being true this must take an explicit
+    org, and this helper returning the first row would become a bug -- noted here rather
+    than silently guessing later.
+    """
+    from sqlalchemy import select as _select
+
+    from app.models import Org as _Org
+
+    row = session.execute(_select(_Org.id).limit(1)).first()
+    if row is None:
+        raise HTTPException(404, "no organisation")
+    return str(row[0])
+
+
 @router.get("/orgs/{org_id}/artifacts")
 async def list_artifacts(org_id: str) -> list[dict[str, Any]]:
     async with SessionLocal() as session:

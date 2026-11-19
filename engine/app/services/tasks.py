@@ -222,6 +222,103 @@ async def open_dependencies(session: AsyncSession, task: Task) -> list[Task]:
     return [d for d in deps if d is not None and d.status not in CLOSED]
 
 
+class ClaimConflict(TaskError):
+    """Raised when a task cannot be claimed because someone else already holds it.
+
+    Separate from TaskError so the HTTP layer can answer 409 instead of 400: "you lost a
+    race" and "you asked for something invalid" are different facts and callers need to
+    tell them apart.
+    """
+
+
+async def claim_task(org_id: str, actor: Sender, ref: str, *, force: bool = False) -> Task:
+    """Atomically take a task for the acting agent.
+
+    Why this exists as its own operation rather than "PATCH status=in_progress and
+    assignee=me": two agents doing that concurrently both succeed, and the second write
+    silently overwrites the first. The loser believes it owns the task and starts work on
+    something another agent is already doing. There was no way to express "claim only if
+    still free" through PATCH, so an agent could not self-assign without a human checking
+    first -- which is exactly what autonomous claiming must not require.
+
+    The guard is the row lock, not a hopeful read: `with_for_update()` is taken inside the
+    transaction, so two concurrent claims serialise on the row and the second one observes
+    the first one's assignee. An already-held task is refused unless `force=True` (used by
+    a supervisor reassigning work, never by the claiming agent itself).
+    """
+    if actor.type != "agent":
+        raise ClaimConflict("only an agent can claim a task; a person assigns instead")
+
+    async with SessionLocal() as session:
+        task = await find_task(session, org_id, ref)
+        if task is None:
+            raise ClaimConflict(f"task '{ref}' not found")
+        # Lock the row first; everything below reads the locked version, so no other
+        # transaction can slip an assignee in between the check and the write.
+        task = (
+            await session.execute(select(Task).where(Task.id == task.id).with_for_update())
+        ).scalar_one()
+        org = await session.get(Org, org_id)
+        assert org is not None
+
+        if task.status in CLOSED:
+            raise ClaimConflict(f"task '{ref}' is {task.status} and cannot be claimed")
+        if task.assignee_id == actor.id:
+            return task  # idempotent: claiming what you already hold is a no-op
+        if task.assignee_id and not force:
+            raise ClaimConflict(
+                f"task '{ref}' is already held by another agent; pick a different task "
+                "instead of taking someone else's work")
+        waiting = [task_ref(d) for d in await open_dependencies(session, task)]
+        if waiting:
+            raise ClaimConflict(
+                f"task '{ref}' still waits on {', '.join(waiting)}; it cannot be claimed yet")
+
+        await permissions.check_edit(session, org, actor.id, actor.type, task)
+
+        previous_assignee = task.assignee_id
+        task.assignee_id = actor.id
+        if task.status in ("backlog", "todo"):
+            task.status = "in_progress"
+        session.add(TaskEvent(task_id=task.id, actor_id=actor.id, kind="claimed",
+                              data={"from": previous_assignee, "to": actor.id,
+                                    "status": task.status, "forced": bool(force)}))
+        await session.commit()
+
+    await bus.publish("task.claimed", task_to_dict(task), org_id=org_id, agent_id=actor.id)
+    return task
+
+
+async def claim_next(org_id: str, actor: Sender, *, label: str | None = None) -> Task | None:
+    """Claim the first task that is actually free, or return None.
+
+    This is the entry point autonomous work needs: "give me something to do" without a
+    human naming it. Selection order is deliberately boring -- oldest first, open status,
+    unassigned, no unmet dependencies -- because a clever heuristic here would be a policy
+    nobody asked for and impossible to audit. `label` narrows to one business area so two
+    agents do not fight over the same queue.
+    """
+    if actor.type != "agent":
+        raise ClaimConflict("only an agent can claim a task")
+
+    async with SessionLocal() as session:
+        stmt = (select(Task).where(Task.org_id == org_id, Task.assignee_id.is_(None),
+                                  Task.status.in_(("backlog", "todo")))
+                .order_by(Task.created_at.asc()))
+        candidates = (await session.execute(stmt)).scalars().all()
+
+    for task in candidates:
+        if label and label not in (task.labels or []):
+            continue
+        try:
+            return await claim_task(org_id, actor, task_ref(task))
+        except ClaimConflict:
+            # Someone took it between listing and claiming. That is the race this design
+            # exists to survive; move on rather than failing the whole call.
+            continue
+    return None
+
+
 async def update_task(
     org_id: str,
     actor: Sender,
