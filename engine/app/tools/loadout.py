@@ -23,7 +23,13 @@ CORE = frozenset({
     "spawn_subagent", "todo", "load_tools",
 })
 # Also offered whole to someone with colleagues: a team member coordinates on most turns.
-TEAM_CORE = frozenset({"send_message", "create_task", "update_task", "list_tasks", "get_task"})
+# claim_task belongs here because autonomous claiming is the same kind of act as update_task:
+# an agent that has to discover it by name first will not reach for it when it is idle, and
+# will instead poke at the API through the shell looking for a way to take work. That is
+# exactly what happened before it was added -- the tool existed but was never offered, so
+# "an agent can claim work" was true in the schema and false in practice.
+TEAM_CORE = frozenset({"send_message", "create_task", "update_task", "list_tasks", "get_task",
+                       "claim_task"})
 LEAN_ABOVE = 20  # an agent with this many tools or fewer gets them all
 # Tools an agent used in its last this-many calls stay offered from turn to turn. A timed run
 # loaded tools 51 times in 553 calls (stage_check five times in one turn): what was loaded
