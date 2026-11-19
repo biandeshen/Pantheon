@@ -346,6 +346,69 @@ async def claim_task(args: dict, ctx: ToolContext) -> str:
     return f"Claimed {ref} ({t.title}) [{t.status}].{extra}"
 
 
+@tool(
+    "reassign_stalled_task",
+    """Take a task away from an agent that can no longer work, and give it to someone who can.
+Supervisor only.
+
+This exists for one situation: a task sits in progress under an agent that is disabled,
+paused, standby, or in error, so it will never move again on its own. You can see that from
+org_activity. Nothing else in the system closes that gap -- claim_task refuses a held task
+(correctly: two agents on one task is worse than one stuck task), and an ordinary agent
+cannot take someone else's work. So the holder has to be told, by someone with the standing
+to do it.
+
+It will NOT steal from a healthy holder. If the assignee is active and working, this refuses
+and tells you to message them instead. Reassigning a live agent's work is a management
+decision made by talking to them, not by a tool that quietly moves their task.
+
+The partial result stays exactly where it is: this changes the assignee and nothing else.""",
+    obj({
+        "task": {"type": "string", "description": "Task ref, e.g. T-52."},
+        "to": {"type": "string", "description": "Agent who should take over, e.g. Kit."},
+        "reason": {"type": "string", "description": "Why the current holder cannot continue."},
+    }, ["task", "to", "reason"]),
+    category="tasks",
+)
+async def reassign_stalled_task(args: dict, ctx: ToolContext) -> str:
+    # Supervisor-only, and deliberately narrow. Two separate safeguards, because each one
+    # alone would leave a hole:
+    #   - the caller must be a supervisor, or any agent could take any task by calling this;
+    #   - the current holder must be unable to work, or this becomes a stealth way to steal
+    #     live work -- which is the thing claim_task's 409 exists to prevent.
+    if not getattr(ctx.agent, "is_supervisor", False):
+        raise ToolError("only a supervisor can reassign someone else's task; "
+                        "use claim_task for unassigned work")
+    from app.core.db import SessionLocal
+    from app.models import Agent, Task
+
+    async with SessionLocal() as session:
+        t = await tasks.find_task(session, ctx.org.id, str(args["task"]))
+        if t is None:
+            raise ToolError(f"no task {args['task']} in this organisation")
+        holder = await session.get(Agent, t.assignee_id) if t.assignee_id else None
+        if holder is None:
+            raise ToolError(f"{task_ref(t)} has no assignee; use claim_task or update_task")
+        if holder.id == ctx.agent.id:
+            raise ToolError(f"you already hold {task_ref(t)}")
+        # A holder that can still run is not stalled. Message them.
+        if holder.status == "active" and holder.runtime_status not in (
+                "error", "awaiting_approval"):
+            raise ToolError(
+                f"{holder.name} is active ({holder.runtime_status}); this tool is for stalled "
+                f"holders only. Message {holder.name} about {task_ref(t)} instead of taking it.")
+        stalled_because = f"status={holder.status}, runtime={holder.runtime_status}"
+        task_id, ref = t.id, task_ref(t)
+
+    t = await tasks.update_task(ctx.org.id, ctx.sender, ref,
+                                assignee=str(args["to"]), status="in_progress")
+    note = (f"Reassigned {ref} from {holder.name} ({stalled_because}) to {args['to']}. "
+            f"Reason given: {args['reason']}. The previous holder's result and comments are "
+            f"kept; the new holder continues from them.")
+    await tasks.update_task(ctx.org.id, ctx.sender, ref, comment=note)
+    return note
+
+
 async def _open_deps(ctx: ToolContext, t: object) -> list[object]:
     from app.core.db import SessionLocal
     from app.models import Task
