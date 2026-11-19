@@ -215,13 +215,68 @@ sign-off — that is the honest state.
   ORM instances read before the lock may be stale. Registered as P2 for the engine; it does not
   affect the current SQLite delivery.
 
+## Failure recovery: measured, and the gap is real
+
+Claim works. What happens when the holder dies is a separate question, and it was tested by
+killing one rather than by reasoning about it.
+
+### How the fault was injected
+
+`PATCH /agents/{id}` with `{"status": "disabled"}` on the holder of T-52. That is not a
+simulation: `runtime._activate()` returns False when `agent.status != "active"`, so no turn of
+that agent can start while disabled. `disabled` is one of the four documented agent statuses,
+so this is a supported operation, not a back door.
+
+### What was measured
+
+| step | observation |
+|---|---|
+| holder disabled | `agent.status = disabled`, `runtime_status = idle` |
+| task state | still `in_progress`, assignee still the dead agent |
+| partial result | the QA comment written before the fault is still there (1 comment) |
+| another agent claims it | **HTTP 409** `already held by another agent; pick a different task` |
+| supervisor PATCH reassign | 200, assignee moves to the new agent, status stays `in_progress` |
+| partial result after reassign | still 1 comment — nothing was wiped |
+| new holder calls `claim_task` | 200, idempotent (`Claimed T-52 ...` while it already holds it) |
+
+So the engine has **no lease and no timeout reclaim**. `reassign_from()` exists, but the only
+caller is `delete_agent` — a dead-but-not-deleted agent keeps its task forever, and the 409
+message tells the next agent to pick something else. Recovery is possible, but only through a
+supervisor PATCH, which means a human or a supervisor agent has to notice.
+
+That is an honest limitation, not a bug in claiming: refusing a steal is the correct default
+(two agents on one task is worse than one stuck task). What is missing is the third path —
+expiry. A claim with no heartbeat should become claimable again after a bound, with the partial
+result preserved and an event saying who lost it and why.
+
+### Event chain, for re-checking
+
+```
+#275 16:55:40  user      created
+#288 21:31:14  sr5kctm4  claimed   {from: null, to: sr5kctm4, forced: false}
+#289 21:31:37  sr5kctm4  comment   the partial result
+#290 22:10:35  user      assignee  {from: sr5kctm4, to: 2rs5rngx}   <- supervisor PATCH
+```
+
+Three real `claim_task` calls now exist: OFM→T-52 (21:31:14), Juno→T-49 (21:43:40, idempotent
+because it already held it), Kit→T-52 (22:11:09, idempotent after the reassign). Two of the
+three are idempotent re-claims, which is itself worth knowing: the tool does the right thing
+when the caller already owns the task, and it says so rather than erroring.
+
+### Not run
+
+- **Automatic reclaim after expiry.** There is nothing to test — no lease exists to expire.
+  Recorded as the gap rather than dressed up as a pass.
+- **Takeover where the dead holder left a half-written file.** The partial result here was a
+  task comment, which the reassign preserved. A file written mid-turn was not exercised.
+
 ## The one-line state
 
-Layers 1 through 5 all hold: the tool is defined, configured, resolved, offered, and on
-2026-11-19 21:31:14 an agent that had never held a task called it for itself and the native
-`claimed` event names that agent. The claim survived a restart.
+Layers 1 through 5 hold, with one real call and two idempotent re-claims recorded. The claim
+survives a restart. Failure recovery works **only through a supervisor reassignment**; the
+engine has no lease, so a disabled holder's task stays `in_progress` until someone notices and
+reassigns, and an agent trying to help gets a 409.
 
-What is still not shown, and is the next question rather than this one: **failure recovery** —
-a second agent taking over from a holder that died mid-work with the partial result preserved.
-Claim works. Reclaim after death does not yet have evidence.
+So: claim is working. Reclaim-after-death is a manual operation. R2 is not satisfied by this
+alone — an autonomous org has to notice the dead holder itself.
 
