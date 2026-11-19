@@ -130,3 +130,79 @@ async def test_a_task_waiting_on_a_dependency_cannot_be_claimed(app_client):
     r = await app_client.post(f"/api/v1/tasks/{dep['id']}/claim", json={"agentId": agent["id"]})
     assert r.status_code == 409, "work must not start on a task whose dependency is open"
     assert blocker["ref"] in r.text
+
+# --- the safety properties the reviewer demanded --------------------------------
+# These are negative tests: they fail if someone later "simplifies" the guard away.
+
+async def test_force_is_not_accepted_from_the_request_body(app_client):
+    """A held task must not be stealable by putting force:true in the body.
+
+    An earlier version read `force` straight out of the request and passed it to
+    claim_task, which meant any caller could override another agent's ownership while the
+    PR text claimed force was supervisor-only. Nothing in the HTTP surface may take a held
+    task; reassignment is PATCH, which is auditable.
+    """
+    org = await make_org(app_client)
+    ann = await make_agent(app_client, org["id"], "Ann")
+    bob = await make_agent(app_client, org["id"], "Bob")
+    task = await _task(app_client, org["id"])
+
+    first = await app_client.post(f"/api/v1/tasks/{task['id']}/claim", json={"agentId": ann["id"]})
+    assert first.status_code == 200, first.text
+
+    steal = await app_client.post(f"/api/v1/tasks/{task['id']}/claim",
+                                  json={"agentId": bob["id"], "force": True})
+    assert steal.status_code == 409, (
+        f"force must not be honoured from the body; got {steal.status_code}: {steal.text}")
+
+    stored = (await rows(Task, Task.id == task["id"]))[0]
+    assert stored.assignee_id == ann["id"], "the original owner must survive a forced steal attempt"
+
+async def test_claiming_without_naming_an_agent_is_refused(app_client):
+    """A claim recorded against the user would be meaningless: the user assigns via PATCH."""
+    org = await make_org(app_client)
+    await make_agent(app_client, org["id"], "Ann")
+    task = await _task(app_client, org["id"])
+
+    r = await app_client.post(f"/api/v1/tasks/{task['id']}/claim", json={})
+    assert r.status_code == 400, f"missing agentId must be refused, got {r.status_code}"
+
+    stored = (await rows(Task, Task.id == task["id"]))[0]
+    assert stored.assignee_id is None, "a refused claim must not assign anybody"
+
+async def test_claiming_in_another_org_does_not_reach_a_foreign_task(app_client):
+    """Two orgs must not see each other's tasks through the claim route."""
+    ours = await make_org(app_client, "Ours")
+    theirs = await make_org(app_client, "Theirs")
+    ann = await make_agent(app_client, ours["id"], "Ann")
+    await make_agent(app_client, theirs["id"], "Eve")
+    task = await _task(app_client, ours["id"])
+
+    # Eve claims via the claim-next route scoped to her own org: she must get nothing,
+    # because our task belongs to another organisation.
+    r = await app_client.post(f"/api/v1/orgs/{theirs['id']}/tasks/claim-next",
+                              json={"agentId": "Eve"})
+    assert r.status_code == 204, f"foreign org must not yield our task, got {r.status_code}"
+
+    stored = (await rows(Task, Task.id == task["id"]))[0]
+    assert stored.assignee_id is None, "our task must remain untouched"
+
+async def test_claim_next_empty_queue_is_a_real_204_without_a_body(app_client):
+    """204 must carry no body; a JSON payload with a 204 is a broken contract."""
+    org = await make_org(app_client)
+    await make_agent(app_client, org["id"], "Ann")
+
+    r = await app_client.post(f"/api/v1/orgs/{org['id']}/tasks/claim-next",
+                              json={"agentId": "Ann"})
+    assert r.status_code == 204, r.text
+    assert r.content == b"", f"204 must have an empty body, got {r.content!r}"
+
+async def test_claiming_by_task_ref_works(app_client):
+    """`_sole_org_id` must be awaited; a sync call there would break ref-based claiming."""
+    org = await make_org(app_client)
+    agent = await make_agent(app_client, org["id"], "Ann")
+    task = await _task(app_client, org["id"])
+
+    r = await app_client.post(f"/api/v1/tasks/{task['ref']}/claim", json={"agentId": agent["id"]})
+    assert r.status_code == 200, f"claiming by ref must resolve the org: {r.text}"
+    assert r.json()["assigneeId"] == agent["id"]

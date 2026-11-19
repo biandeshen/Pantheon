@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
 
 from app.core.db import SessionLocal
@@ -122,27 +122,37 @@ async def update_task(task_id: str, body: dict[str, Any] = Body(...)) -> dict[st
 
 @router.post("/tasks/{task_id}/claim")
 async def claim_task(task_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-    """Take a task for one agent, atomically.
+    """Claim a task on behalf of one agent. Operator/supervisor entry point.
 
-    `agentId` names the claimant. It is required in practice: claiming is something an
-    agent does for itself, and a claim recorded against the user would defeat the point
-    (the user already assigns work through PATCH). Omitting it is refused rather than
-    silently resolved to the user, so a caller cannot end up believing an agent took work
-    it never took.
+    TRUST BOUNDARY: `agentId` comes from the request body, and AccessMiddleware only proves
+    the caller is local or holds the shared access code -- it does not prove which agent is
+    asking. So this route can record a claim attributed to an agent that did not make the
+    call. That is acceptable here because this route exists for an operator acting with the
+    same authority they already have through PATCH (which can set assignee directly), and
+    because it cannot be used to grant permissions the caller lacks: claim_task enforces the
+    org's assign policy and the target agent's own edit scope.
 
-    409 means someone else holds it -- a race the caller survives by picking another task,
-    not an error in the request. 404 means it does not exist.
+    It is NOT the autonomous path. An agent claiming for itself goes through the
+    `claim_task` tool, where the claimant is ctx.sender and cannot be forged. Treating this
+    HTTP route as proof of "agent X claimed this" would be wrong; the event says who the
+    work belongs to, and the tool is what makes that trustworthy.
+
+    There is deliberately no `force` here. A supervisor who wants to take a held task away
+    reassigns it with PATCH, which is an explicit, auditable reassignment -- not a claim
+    that quietly overrides another agent's ownership.
+
+    409 means someone else holds it. 404 means it does not exist.
     """
     agent_ref = body.get("agentId") or body.get("agent")
     if not agent_ref:
         raise HTTPException(400, "agentId is required: claiming is an agent action")
     async with SessionLocal() as session:
         t = await session.get(Task, task_id)
-        if t is None:
-            org_id = _sole_org_id(session)
-            t = await tasks.find_task(session, org_id, task_id)
-        else:
+        if t is not None:
             org_id = t.org_id
+        else:
+            org_id = await _sole_org_id(session)
+            t = await tasks.find_task(session, org_id, task_id)
         if t is None:
             raise HTTPException(404, "task not found")
         from app.services.tasks import _resolve_person
@@ -152,8 +162,7 @@ async def claim_task(task_id: str, body: dict[str, Any] = Body(default={})) -> d
             raise HTTPException(404, f"agent '{agent_ref}' not found")
 
     try:
-        claimed = await tasks.claim_task(org_id, Sender("agent", agent_id), t.id,
-                                         force=bool(body.get("force")))
+        claimed = await tasks.claim_task(org_id, Sender("agent", agent_id), t.id)
     except tasks.ClaimConflict as e:
         raise HTTPException(409, str(e)) from None
     except tasks.TaskError as e:
@@ -163,7 +172,7 @@ async def claim_task(task_id: str, body: dict[str, Any] = Body(default={})) -> d
 
 @router.post("/orgs/{org_id}/tasks/claim-next")
 async def claim_next_task(org_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-    """Claim the next free task for one agent, or 204 when there is nothing free."""
+    """Claim the next free task for one agent. Operator entry point; see caveat above."""
     agent_ref = body.get("agentId") or body.get("agent")
     if not agent_ref:
         raise HTTPException(400, "agentId is required: claiming is an agent action")
@@ -180,11 +189,11 @@ async def claim_next_task(org_id: str, body: dict[str, Any] = Body(default={})) 
     except tasks.ClaimConflict as e:
         raise HTTPException(409, str(e)) from None
     if claimed is None:
-        raise HTTPException(204, "no claimable task")
+        return Response(status_code=204)
     return task_to_dict(claimed)
 
 
-def _sole_org_id(session: Any) -> str:
+async def _sole_org_id(session: Any) -> str:
     """Resolve the single organisation when the caller used a task ref.
 
     Pantheon trial runs one org. If that ever stops being true this must take an explicit
@@ -195,7 +204,7 @@ def _sole_org_id(session: Any) -> str:
 
     from app.models import Org as _Org
 
-    row = session.execute(_select(_Org.id).limit(1)).first()
+    row = (await session.execute(_select(_Org.id).limit(1))).first()
     if row is None:
         raise HTTPException(404, "no organisation")
     return str(row[0])

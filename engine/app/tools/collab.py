@@ -308,6 +308,54 @@ async def _known_tasks(org_id: str, refs: list[str]) -> tuple[list[str], list[st
 
 
 @tool(
+    "claim_task",
+    """Take a task for yourself, atomically. Use this instead of update_task when you are
+picking up work that nobody has been assigned yet: if another agent is claiming the same
+task at the same moment, exactly one of you gets it and the other is told it is taken.
+
+With no argument it takes the oldest free task. Pass task="T-12" to claim a specific one,
+or label="research" to restrict to one area. Claiming a task you already hold does nothing.
+If nothing is free it says so -- it never invents work.""",
+    obj({
+        "task": {"type": "string", "description": "Task ref to claim, e.g. T-12. Omit for the next free one."},
+        "label": S,
+    }, []),
+    category="tasks",
+)
+async def claim_task(args: dict, ctx: ToolContext) -> str:
+    # The claimant is ctx.sender, never a value from the request: an agent can only claim
+    # for itself. There is deliberately no `agent` argument here and no `force` either --
+    # letting a caller name someone else, or take a held task, is exactly the impersonation
+    # and strong-arming this tool exists to prevent. A supervisor reassigning work uses
+    # update_task, which is a person-originated action with its own permission check.
+    try:
+        if args.get("task"):
+            t = await tasks.claim_task(ctx.org.id, ctx.sender, str(args["task"]))
+        else:
+            t = await tasks.claim_next(ctx.org.id, ctx.sender, label=args.get("label"))
+    except tasks.ClaimConflict as e:
+        raise ToolError(str(e)) from None
+    except TaskError as e:
+        raise ToolError(str(e)) from None
+    if t is None:
+        return ("Nothing free to claim right now: no open unassigned task without unmet "
+                "dependencies. Ask someone what to pick up instead of inventing work.")
+    ref = task_ref(t)
+    waiting = [task_ref(d) for d in await _open_deps(ctx, t)]
+    extra = f" It still waits on {', '.join(waiting)}." if waiting else ""
+    return f"Claimed {ref} ({t.title}) [{t.status}].{extra}"
+
+
+async def _open_deps(ctx: ToolContext, t: object) -> list[object]:
+    from app.core.db import SessionLocal
+    from app.models import Task
+
+    async with SessionLocal() as session:
+        fresh = await session.get(Task, t.id)  # type: ignore[attr-defined]
+        return await tasks.open_dependencies(session, fresh) if fresh is not None else []
+
+
+@tool(
     "update_task",
     f"""Update a task: move it between statuses ({", ".join(STATUSES)}), reassign it,
 record the result, or add a comment. When your work is finished and checked, move it to
