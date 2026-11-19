@@ -270,6 +270,68 @@ when the caller already owns the task, and it says so rather than erroring.
 - **Takeover where the dead holder left a half-written file.** The partial result here was a
   task comment, which the reassign preserved. A file written mid-turn was not exercised.
 
+## Handing over: who is allowed to, and who actually can
+
+The failure-recovery section above ends with "recovery is possible but needs a supervisor to
+notice". That sentence hid a second problem, and an agent found it rather than me.
+
+### The supervisor could see it and could not act
+
+Asked to help with the disabled holder, the platform supervisor loaded `org_activity`, `get_task`
+and `list_tasks` successfully — so it could see the stalled task — and then asked for the tools
+it would need:
+
+```
+tool.started    load_tools  {"names": ["reassign_task", "set_task_assignee",
+                                        "list_org_tasks", "get_org_task"]}
+tool.completed  load_tools  ERROR: you have no tool named reassign_task,
+                                        set_task_assignee, list_org_tasks, get_org_task
+```
+
+None of them existed. And `claim_task`'s own docstring claimed "a supervisor reassigning work
+uses update_task" — while `update_task` was not in the supervisor's tool list either. The
+comment described a path that was not there.
+
+### What was added, and its bounds
+
+`reassign_stalled_task`, supervisor only, and narrow on purpose:
+
+| guard | why |
+|---|---|
+| caller must be `is_supervisor` | otherwise any agent could take any task by calling it |
+| holder must be unable to work | otherwise it is a stealth way to steal live work — exactly what claim_task's 409 prevents |
+| changes assignee only | the previous holder's result and comments stay, so a takeover continues rather than restarts |
+| appends a comment | names who lost it, why, and where to continue |
+
+Not added: a lease, an expiry, or automatic reclaim. A general lease engine is a larger design
+question; this is the smallest thing that closes "a dead holder blocks a task forever".
+
+`is_supervisor` cannot be set through the HTTP API — both create and patch strip it — which is
+a correct guard, so the tests promote the agent through the internal path that seeded
+supervisors use.
+
+### The half that is still missing
+
+The three supervisors (Zeus, Argus, Kronos) all belong to `org_pantheon`. `get_task` and
+`update_task` are org-scoped. **There is no supervisor inside the trial org at all.**
+
+So the tool closes the capability gap and the org still has no subject with the standing to use
+it. "The org's own supervisor notices and hands over" remains unproven, not because the action
+is impossible but because nobody in that org can perform it. That is a structural gap, and it is
+the one to solve next rather than another tool.
+
+### Tests
+
+`tests/test_reassign_stalled.py` — 5 passed:
+
+- a supervisor takes a task from a disabled holder
+- the partial result survives the reassignment
+- a healthy holder keeps their work (the guard that makes this not-a-steal)
+- a non-supervisor is refused
+- an unassigned task is refused
+
+With `test_claim.py` and `test_claim_tool.py`: 25 passed.
+
 ## The one-line state
 
 Layers 1 through 5 hold, with one real call and two idempotent re-claims recorded. The claim
@@ -277,6 +339,7 @@ survives a restart. Failure recovery works **only through a supervisor reassignm
 engine has no lease, so a disabled holder's task stays `in_progress` until someone notices and
 reassigns, and an agent trying to help gets a 409.
 
-So: claim is working. Reclaim-after-death is a manual operation. R2 is not satisfied by this
-alone — an autonomous org has to notice the dead holder itself.
+So: claim is working. Reclaim-after-death is a manual operation, and now a supervisor has a
+tool for it — but the trial org has no supervisor, so in practice it is still a person.
+R2 is not satisfied by this alone — an autonomous org has to notice the dead holder itself.
 
