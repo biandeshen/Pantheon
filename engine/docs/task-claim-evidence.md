@@ -86,36 +86,59 @@ Proves: the model is told the tool exists. Nothing about it being used.
 
 ## Layer 5 — invoked: a fresh agent actually calls it
 
-**Not satisfied.** Measured on the same database:
+**Satisfied on 2026-11-19 21:31:14 UTC**, after four attempts that each looked like a different
+kind of failure.
 
-| counter | value |
-|---|---|
-| `tool_calls` where `name = 'claim_task'` | **0** |
-| `tool_calls` where `name = 'load_tools'` | 16 |
-| `tool_calls` where `name = 'update_task'` | 185 |
-
-Two recorded attempts show the gap from the other side. At 19:22:39 Kit asked for the tool
-by name and was told it did not exist — this is the pre-fix state, and it is the clearest
-statement of the bug:
+The claim that worked came from `OFM Gateway Verifier` (`agt_01m7fq8xdwctsr5kctm4`), an agent
+that had never held a task, using the tool rather than the API:
 
 ```
-#14063 19:22:39  tool.started    2rs5rngx  load_tools {"names": ["claim_task"]}
-#14067 19:22:39  tool.completed  2rs5rngx  load_tools ERROR: you have no tool named claim_task
-#14073 19:22:45  agent.thought   2rs5rngx  "我没有 claim_task 工具（load_tools 返回 ...）"
+#14797 21:31:14  tool.started    sr5kctm4  claim_task
+        toolCallId call_336e2fe2de4e40afa3cfbdcd
+        turnId     trn_01m7tvgfchqvmvgfas08
+        args       {"task": "T-52"}
+#14799 21:31:14  tool.completed  sr5kctm4
+        result     Claimed T-52 (R2 finish: ...) [in_progress]
 ```
 
-And at 20:02:45 the work that actually moved T-49 was an HTTP PATCH inside a script, not a
-tool call:
+and the native event it produced, which is the part that matters — the claimant is the agent,
+not a user:
 
 ```
-#14471 20:02:45  approval.decided  5y75eyvm  run_command  {"command": "node r2-deliver.mjs"}
+#288 21:31:14  task_events  actor sr5kctm4  kind claimed
+     {"from": null, "to": "agt_01m7fq8xdwctsr5kctm4", "status": "in_progress", "forced": false}
 ```
 
-`r2-deliver.mjs` contains `method: 'PATCH'` and a body setting `status`, `assigneeId` and
-`reviewerId` directly. That is the operator path. It is a legitimate way for a person to
-reassign work; it is not evidence that an agent claimed work for itself.
+Offered-layer record for the turn that did it: `llm_01m7tvhzhzr6x4shxnm5`, turn
+`trn_01m7tvgfchqvmvgfas08`, 19 tools offered, `claim_task` among them.
 
-Proves: nothing yet. This is the open item.
+Persisted across a restart: stopped the engine, started it again, and `T-52` came back
+`in_progress` with the same assignee and exactly one `claimed` event. The claim is a durable
+fact, not an in-process artefact.
+
+### The four attempts before it, because they are the useful part
+
+1. **Kit, 19:22:39** — asked for the tool by name and was refused:
+   `load_tools {"names": ["claim_task"]}` → `ERROR: you have no tool named claim_task`. This is
+   the pre-fix state and it is the cleanest statement of the original bug.
+2. **Juno** — asked twice, in plain words, to call it. Both times wrote another `.mjs` script
+   that did an HTTP PATCH instead. The tool was in its config by then.
+3. **FREE-EXEC Verification Agent** — configured correctly, but every turn failed with
+   `LLMFailure: OpenAIConnectionError`; it points at a different provider
+   (`qwen/qwen3.5-9b`) that was not reachable. Four retry attempts, then it gave up.
+4. **OFM Gateway Verifier** — same seven tools as FREE-EXEC, same working provider as the rest
+   of the org, idle. Worked on the first try.
+
+Two lessons worth keeping. An agent that has already built a habit of reaching for the shell
+will keep reaching for it even after the tool arrives — Juno's two misses were not a tool
+problem, they were a habit, and the thing that finally settled it was asking an agent with no
+habit at all. And "the agent did not call it" is worth decomposing before concluding the tool
+is broken: three of the four failures had nothing to do with `claim_task`.
+
+The earlier note still stands as history: at that point `tool_calls WHERE name='claim_task'`
+was **0** against 185 `update_task`, and the work that moved T-49 was a script doing an HTTP
+PATCH under the user identity (`r2-deliver.mjs`, approval at 20:02:45) — legitimate as an
+operator reassigning work, never evidence of an agent claiming.
 
 ## What T-49 actually was, and who did what
 
@@ -194,7 +217,11 @@ sign-off — that is the honest state.
 
 ## The one-line state
 
-Layers 1 through 4 hold. Layer 5 — a fresh agent calling `claim_task` for itself, with tools
-offering it, `ctx.sender` as the claimant, a native `claimed` event and a surviving turn —
-remains **NOT VERIFIED**. Until that happens, claim is READY, not working, and R2 is not
-satisfied.
+Layers 1 through 5 all hold: the tool is defined, configured, resolved, offered, and on
+2026-11-19 21:31:14 an agent that had never held a task called it for itself and the native
+`claimed` event names that agent. The claim survived a restart.
+
+What is still not shown, and is the next question rather than this one: **failure recovery** —
+a second agent taking over from a holder that died mid-work with the partial result preserved.
+Claim works. Reclaim after death does not yet have evidence.
+
