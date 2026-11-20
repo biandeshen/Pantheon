@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import select
 
 from app.core.db import SessionLocal
-from app.models import Agent, Channel, FeatureRequest, Relationship
+from app.models import Agent, Task, TaskEvent, Channel, FeatureRequest, Relationship
 from app.services import comms, memory, tasks
 from app.services.comms import USER, CommsError
-from app.services.tasks import STATUSES, TaskError, task_ref
+from app.services import permissions
+from app.services.tasks import CLOSED, STATUSES, TaskError, task_ref
 from app.tools.base import B, I, S, ToolContext, ToolError, arr, obj, tool
+
+log = logging.getLogger(__name__)
 
 
 async def _names(org_id: str) -> dict[str, str]:
@@ -380,32 +385,74 @@ async def reassign_stalled_task(args: dict, ctx: ToolContext) -> str:
         raise ToolError("only a supervisor can reassign someone else's task; "
                         "use claim_task for unassigned work")
     from app.core.db import SessionLocal
-    from app.models import Agent, Task
+    from app.models import Agent, Task, TaskEvent, Task
 
+    # Check and write in ONE transaction, with the row locked. Two reasons, both learned the
+    # hard way in this batch:
+    #   - the check-then-write used to run in separate sessions, so a holder could come back
+    #     to life between them and lose work it had resumed;
+    #   - without the lock, two supervisors could both see "stalled" and both reassign.
+    org_id, ref, to_ref, reason = ctx.org.id, str(args["task"]), str(args["to"]), str(args["reason"])
     async with SessionLocal() as session:
-        t = await tasks.find_task(session, ctx.org.id, str(args["task"]))
+        t = await tasks.find_task(session, org_id, ref)
         if t is None:
-            raise ToolError(f"no task {args['task']} in this organisation")
+            raise ToolError(f"no task {ref} in this organisation")
+        t = (await session.execute(
+            select(Task).where(Task.id == t.id).with_for_update())).scalar_one()
+        ref = task_ref(t)
+
+        # A closed task is finished business. Moving it back to in_progress would reopen
+        # something a reviewer closed, which is not a handover -- reopening is its own
+        # decision made by its own path.
+        if t.status in CLOSED:
+            raise ToolError(f"{ref} is {t.status}; finished work is not reassigned. "
+                            f"Reopening it is a separate decision.")
+        # A task sitting in review is waiting on a reviewer, not on the holder. Taking it
+        # from the holder would discard a hand-in that someone is about to read.
+        if t.status == "review":
+            raise ToolError(f"{ref} is in review waiting for its reviewer; reassigning it "
+                            f"would throw away the submitted work.")
+
         holder = await session.get(Agent, t.assignee_id) if t.assignee_id else None
         if holder is None:
-            raise ToolError(f"{task_ref(t)} has no assignee; use claim_task or update_task")
+            raise ToolError(f"{ref} has no assignee; use claim_task or update_task")
         if holder.id == ctx.agent.id:
-            raise ToolError(f"you already hold {task_ref(t)}")
-        # A holder that can still run is not stalled. Message them.
-        if holder.status == "active" and holder.runtime_status not in (
-                "error", "awaiting_approval"):
+            raise ToolError(f"you already hold {ref}")
+        # "Waiting for approval" is not being stuck. The agent is blocked on a person, and
+        # will continue the moment that person answers -- taking the task would strand work
+        # it is actively in the middle of. Only a holder that cannot run at all counts.
+        if holder.runtime_status == "awaiting_approval":
+            raise ToolError(
+                f"{holder.name} is not stalled: it is waiting for an approval on {ref}. "
+                f"Approve or deny that request instead of reassigning its work.")
+        if holder.status == "active":
             raise ToolError(
                 f"{holder.name} is active ({holder.runtime_status}); this tool is for stalled "
-                f"holders only. Message {holder.name} about {task_ref(t)} instead of taking it.")
+                f"holders only. Message {holder.name} about {ref} instead of taking it.")
         stalled_because = f"status={holder.status}, runtime={holder.runtime_status}"
-        task_id, ref = t.id, task_ref(t)
+        holder_name = holder.name
 
-    t = await tasks.update_task(ctx.org.id, ctx.sender, ref,
-                                assignee=str(args["to"]), status="in_progress")
-    note = (f"Reassigned {ref} from {holder.name} ({stalled_because}) to {args['to']}. "
-            f"Reason given: {args['reason']}. The previous holder's result and comments are "
+        taker = await comms.resolve_agent(session, org_id, to_ref)
+        if taker is None:
+            raise ToolError(f"no colleague named '{to_ref}'")
+        await permissions.check_assign(session, ctx.org, ctx.agent.id, "agent", taker.id)
+        t.assignee_id = taker.id
+        t.status = "in_progress"
+        session.add(TaskEvent(task_id=t.id, actor_id=ctx.agent.id, kind="assignee",
+                              data={"from": holder.id, "to": taker.id,
+                                    "why": f"reassigned from stalled holder ({stalled_because})",
+                                    "reason": reason}))
+        await session.commit()
+
+    note = (f"Reassigned {ref} from {holder_name} ({stalled_because}) to {to_ref}. "
+            f"Reason given: {reason}. The previous holder's result and comments are "
             f"kept; the new holder continues from them.")
-    await tasks.update_task(ctx.org.id, ctx.sender, ref, comment=note)
+    # The comment is a separate write: it must not be able to fail the reassignment that
+    # already happened, or the task would be moved with no record of why.
+    try:
+        await tasks.update_task(org_id, ctx.sender, ref, comment=note)
+    except Exception:  # pragma: no cover - the move itself is already committed
+        log.warning("reassign note failed for %s", ref)
     return note
 
 

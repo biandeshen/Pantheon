@@ -163,3 +163,156 @@ async def test_it_says_so_when_the_task_has_no_holder(app_client):
         await collab.reassign_stalled_task(
             {"task": task["ref"], "to": "H5", "reason": "nobody has it"}, ctx)
     assert "no assignee" in str(e.value).lower(), e.value
+
+
+# --- three guards added after review, each one a mistake in the first version -----------
+# All three were found by reading the code against real states, not by a failing test. The
+# tests are written so that removing the guard fails them.
+
+async def test_a_holder_waiting_for_approval_is_not_stalled(app_client):
+    """awaiting_approval means blocked on a person, not broken.
+
+    The first version listed awaiting_approval as a stall reason. That would let a supervisor
+    take work from an agent that is mid-task and simply waiting for a human to answer -- and
+    strand the work it had already done.
+    """
+    org = await make_org(app_client)
+    holder = await make_agent(app_client, org["id"], "Waiter")
+    await make_agent(app_client, org["id"], "Other6")
+    sup = await _make_supervisor(app_client, org["id"], "Boss6")
+    task = await _task(app_client, org["id"])
+
+    await app_client.post(f"/api/v1/tasks/{task['id']}/claim", json={"agentId": holder["id"]})
+    # Simulate "its turn is blocked on an approval" without needing a real shell request.
+    from app.core.db import SessionLocal
+
+    async with SessionLocal() as s:
+        h = await s.get(Agent, holder["id"])
+        h.runtime_status = "awaiting_approval"
+        await s.commit()
+
+    ctx = await _ctx(org["id"], sup["id"])
+    with pytest.raises(ToolError) as e:
+        await collab.reassign_stalled_task(
+            {"task": task["ref"], "to": "Other6", "reason": "looks stuck"}, ctx)
+    assert "approval" in str(e.value).lower(), e.value
+
+    stored = (await rows(Task, Task.id == task["id"]))[0]
+    assert stored.assignee_id == holder["id"], "a holder blocked on approval keeps its task"
+
+
+async def test_a_task_in_review_is_never_reassigned(app_client):
+    """Review is waiting on a reviewer. Taking it would discard the submitted work."""
+    org = await make_org(app_client)
+    holder = await make_agent(app_client, org["id"], "Submitter")
+    await make_agent(app_client, org["id"], "Other7")
+    sup = await _make_supervisor(app_client, org["id"], "Boss7")
+    task = await _task(app_client, org["id"])
+
+    await app_client.post(f"/api/v1/tasks/{task['id']}/claim", json={"agentId": holder["id"]})
+    r = await app_client.patch(f"/api/v1/tasks/{task['id']}",
+                               json={"status": "review", "result": "done, please review"})
+    assert r.status_code == 200, r.text
+    await app_client.patch(f"/api/v1/agents/{holder['id']}", json={"status": "disabled"})
+
+    ctx = await _ctx(org["id"], sup["id"])
+    with pytest.raises(ToolError) as e:
+        await collab.reassign_stalled_task(
+            {"task": task["ref"], "to": "Other7", "reason": "holder gone"}, ctx)
+    assert "review" in str(e.value).lower(), e.value
+
+    stored = (await rows(Task, Task.id == task["id"]))[0]
+    assert stored.status == "review", "a submitted task stays submitted"
+    assert stored.result, "and its submitted result is not wiped"
+
+
+async def test_a_closed_task_is_never_reopened_by_a_handover(app_client):
+    """done is finished business. Reopening is its own decision, not a side effect."""
+    org = await make_org(app_client)
+    holder = await make_agent(app_client, org["id"], "Finisher")
+    await make_agent(app_client, org["id"], "Other8")
+    sup = await _make_supervisor(app_client, org["id"], "Boss8")
+    task = await _task(app_client, org["id"])
+
+    await app_client.post(f"/api/v1/tasks/{task['id']}/claim", json={"agentId": holder["id"]})
+    r = await app_client.patch(f"/api/v1/tasks/{task['id']}",
+                               json={"status": "done", "result": "finished and checked"})
+    assert r.status_code == 200, r.text
+    await app_client.patch(f"/api/v1/agents/{holder['id']}", json={"status": "disabled"})
+
+    ctx = await _ctx(org["id"], sup["id"])
+    with pytest.raises(ToolError) as e:
+        await collab.reassign_stalled_task(
+            {"task": task["ref"], "to": "Other8", "reason": "holder gone"}, ctx)
+    assert "done" in str(e.value).lower() or "finished" in str(e.value).lower(), e.value
+
+    stored = (await rows(Task, Task.id == task["id"]))[0]
+    assert stored.status == "done", "a finished task must stay finished"
+
+
+async def test_the_reassignment_writes_an_event_with_the_reason(app_client):
+    """The move is auditable: who lost it, who took it, and why."""
+    org = await make_org(app_client)
+    holder = await make_agent(app_client, org["id"], "Gone")
+    taker = await make_agent(app_client, org["id"], "Next")
+    sup = await _make_supervisor(app_client, org["id"], "Boss9")
+    task = await _task(app_client, org["id"])
+
+    await app_client.post(f"/api/v1/tasks/{task['id']}/claim", json={"agentId": holder["id"]})
+    await app_client.patch(f"/api/v1/agents/{holder['id']}", json={"status": "disabled"})
+
+    ctx = await _ctx(org["id"], sup["id"])
+    await collab.reassign_stalled_task(
+        {"task": task["ref"], "to": "Next", "reason": "holder disabled mid-work"}, ctx)
+
+    from app.models import TaskEvent
+
+    evs = await rows(TaskEvent, TaskEvent.task_id == task["id"], TaskEvent.kind == "assignee")
+    assert evs, "the reassignment must be in the event log"
+    last = evs[-1]
+    assert last.actor_id == sup["id"], "the supervisor is the actor, not the taker"
+    payload = last.data if isinstance(last.data, dict) else {}
+    assert payload.get("to") == taker["id"], f"the new holder is recorded: {payload}"
+    assert payload.get("from") == holder["id"], "and the previous holder is recorded"
+    assert "disabled" in (payload.get("why") or ""), "the stall reason is recorded"
+    assert payload.get("reason") == "holder disabled mid-work", "the operator's reason is kept"
+
+
+async def test_the_assignment_is_committed_before_the_note_is_written(app_client):
+    """The move and its record are separate writes, on purpose, in that order.
+
+    If the note were written first and the move then failed, the log would claim a handover
+    that never happened. If the move happened and the note failed, the task is still correctly
+    moved and only the explanation is missing -- the less harmful failure. This test pins the
+    order by checking the assignment is durable even when the comment path is what breaks it.
+    """
+    org = await make_org(app_client)
+    holder = await make_agent(app_client, org["id"], "DeadA")
+    taker = await make_agent(app_client, org["id"], "NextA")
+    sup = await _make_supervisor(app_client, org["id"], "BossA")
+    task = await _task(app_client, org["id"])
+
+    await app_client.post(f"/api/v1/tasks/{task['id']}/claim", json={"agentId": holder["id"]})
+    await app_client.patch(f"/api/v1/agents/{holder['id']}", json={"status": "disabled"})
+
+    from app.core.db import SessionLocal
+    from app.services import tasks as tasks_svc
+
+    original = tasks_svc.update_task
+
+    async def explode(*a, **kw):
+        # only the note write goes through update_task in the new implementation
+        raise RuntimeError("comment path unavailable")
+
+    tasks_svc.update_task = explode
+    try:
+        ctx = await _ctx(org["id"], sup["id"])
+        out = await collab.reassign_stalled_task(
+            {"task": task["ref"], "to": "NextA", "reason": "holder disabled"}, ctx)
+        assert "Reassigned" in out
+    finally:
+        tasks_svc.update_task = original
+
+    stored = (await rows(Task, Task.id == task["id"]))[0]
+    assert stored.assignee_id == taker["id"], (
+        "the handover must be durable even when the explanatory note cannot be written")
