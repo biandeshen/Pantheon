@@ -7,7 +7,7 @@ import logging
 from sqlalchemy import select
 
 from app.core.db import SessionLocal
-from app.models import Agent, Task, TaskEvent, Channel, FeatureRequest, Relationship
+from app.models import Agent, Channel, FeatureRequest, Org, Relationship, Task, TaskEvent
 from app.services import comms, memory, tasks
 from app.services.comms import USER, CommsError
 from app.services import permissions
@@ -435,7 +435,23 @@ async def reassign_stalled_task(args: dict, ctx: ToolContext) -> str:
         taker = await comms.resolve_agent(session, org_id, to_ref)
         if taker is None:
             raise ToolError(f"no colleague named '{to_ref}'")
-        await permissions.check_assign(session, ctx.org, ctx.agent.id, "agent", taker.id)
+
+        # Reload the org inside this session and run BOTH checks, because they answer
+        # different questions and passing one does not imply the other:
+        #   check_assign -- may this agent hand work to that agent?
+        #   check_edit   -- may this agent change THIS task at all?
+        # An earlier version kept only check_assign, so a supervisor whose edit scope did not
+        # cover the task could still move it. Being allowed to hire someone is not the same as
+        # being allowed to take their work.
+        org = await session.get(Org, org_id)
+        if org is None:
+            raise ToolError("this organisation no longer exists")
+        try:
+            await permissions.check_edit(session, org, ctx.agent.id, "agent", t)
+            await permissions.check_assign(session, org, ctx.agent.id, "agent", taker.id)
+        except permissions.PermissionDenied as e:
+            raise ToolError(str(e)) from None
+
         t.assignee_id = taker.id
         t.status = "in_progress"
         session.add(TaskEvent(task_id=t.id, actor_id=ctx.agent.id, kind="assignee",

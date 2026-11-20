@@ -316,3 +316,76 @@ async def test_the_assignment_is_committed_before_the_note_is_written(app_client
     stored = (await rows(Task, Task.id == task["id"]))[0]
     assert stored.assignee_id == taker["id"], (
         "the handover must be durable even when the explanatory note cannot be written")
+
+
+# --- assign permission is not edit permission -------------------------------------------
+# Found in review of #2, and it was a real hole: the port from update_task kept check_assign
+# and dropped check_edit. An agent allowed to hand work to someone is not automatically
+# allowed to take a task away from its owner.
+
+async def test_a_supervisor_who_may_assign_but_may_not_edit_is_refused(app_client):
+    """Two different permissions, two different questions.
+
+    The org policy here says assign=anyone (the default) but edit=assigned, so the supervisor
+    can tell whose task it should become and still has no right to touch this particular task.
+    Both must be checked; passing the first is not consent for the second.
+    """
+    org = await make_org(app_client)
+    holder = await make_agent(app_client, org["id"], "OwnerX")
+    taker = await make_agent(app_client, org["id"], "NextX")
+    sup = await _make_supervisor(app_client, org["id"], "BossX")
+    task = await _task(app_client, org["id"])
+
+    await app_client.post(f"/api/v1/tasks/{task['id']}/claim", json={"agentId": holder["id"]})
+    await app_client.patch(f"/api/v1/agents/{holder['id']}", json={"status": "disabled"})
+
+    # assign: anyone (default) -- but edit limited to tasks the agent is involved in, which
+    # this supervisor is not.
+    r = await app_client.patch(f"/api/v1/orgs/{org['id']}",
+                               json={"settings": {"task_policy": {"assign": "anyone",
+                                                                  "edit": "assigned"}}})
+    assert r.status_code == 200, r.text
+
+    before = await rows(Task, Task.id == task["id"])
+    assert before[0].assignee_id == holder["id"]
+
+    ctx = await _ctx(org["id"], sup["id"])
+    with pytest.raises(ToolError) as e:
+        await collab.reassign_stalled_task(
+            {"task": task["ref"], "to": "NextX", "reason": "holder disabled"}, ctx)
+    msg = str(e.value).lower()
+    assert "may not change" in msg or "not a task" in msg or "isn't" in msg, e.value
+
+    after = (await rows(Task, Task.id == task["id"]))[0]
+    assert after.assignee_id == holder["id"], "a refused reassignment writes no assignee"
+    assert after.status == "in_progress", "and leaves the status alone"
+
+    from app.models import TaskEvent
+
+    evs = await rows(TaskEvent, TaskEvent.task_id == task["id"], TaskEvent.kind == "assignee")
+    assert not evs, "and records no event that could be mistaken for a handover"
+
+
+async def test_the_permission_error_becomes_a_tool_error_not_a_crash(app_client):
+    """An agent must see a sentence it can act on, not a ValueError traceback."""
+    org = await make_org(app_client)
+    holder = await make_agent(app_client, org["id"], "OwnerY")
+    await make_agent(app_client, org["id"], "NextY")
+    sup = await _make_supervisor(app_client, org["id"], "BossY")
+    task = await _task(app_client, org["id"])
+
+    await app_client.post(f"/api/v1/tasks/{task['id']}/claim", json={"agentId": holder["id"]})
+    await app_client.patch(f"/api/v1/agents/{holder['id']}", json={"status": "disabled"})
+    await app_client.patch(f"/api/v1/orgs/{org['id']}",
+                           json={"settings": {"task_policy": {"edit": "assigned"}}})
+
+    ctx = await _ctx(org["id"], sup["id"])
+    try:
+        await collab.reassign_stalled_task(
+            {"task": task["ref"], "to": "NextY", "reason": "x"}, ctx)
+    except ToolError:
+        pass  # expected: the model gets a message it can read
+    except Exception as e:  # noqa: BLE001
+        raise AssertionError(f"should surface as ToolError, got {type(e).__name__}: {e}") from None
+    else:
+        raise AssertionError("should have been refused")
