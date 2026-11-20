@@ -263,9 +263,13 @@ async def claim_task(org_id: str, actor: Sender, ref: str, *, force: bool = Fals
 
         if task.status in CLOSED:
             raise ClaimConflict(f"task '{ref}' is {task.status} and cannot be claimed")
-        if task.assignee_id == actor.id:
-            return task  # idempotent: claiming what you already hold is a no-op
-        if task.assignee_id and not force:
+        # A task can be given an owner when it is created. Returning early here looked like
+        # the idempotent branch, but it made those tasks impossible to start: the response
+        # said "Claimed ... [todo]" and the row never left todo. Only a task already in
+        # progress is genuinely a no-op; one that is still open must transition.
+        if task.assignee_id == actor.id and task.status not in ("backlog", "todo"):
+            return task  # idempotent: claiming what you are already working on
+        if task.assignee_id and task.assignee_id != actor.id and not force:
             raise ClaimConflict(
                 f"task '{ref}' is already held by another agent; pick a different task "
                 "instead of taking someone else's work")
@@ -277,9 +281,16 @@ async def claim_task(org_id: str, actor: Sender, ref: str, *, force: bool = Fals
         await permissions.check_edit(session, org, actor.id, actor.type, task)
 
         previous_assignee = task.assignee_id
+        previous_status = task.status
         task.assignee_id = actor.id
         if task.status in ("backlog", "todo"):
             task.status = "in_progress"
+            # A claim that starts work must be visible as a status change too. Without it the
+            # timeline says "claimed" while nothing shows the task left todo, which is exactly
+            # how a stuck mission looked normal from the outside.
+            session.add(TaskEvent(task_id=task.id, actor_id=actor.id, kind="status",
+                                  data={"from": previous_status, "to": "in_progress",
+                                        "via": "claim"}))
         session.add(TaskEvent(task_id=task.id, actor_id=actor.id, kind="claimed",
                               data={"from": previous_assignee, "to": actor.id,
                                     "status": task.status, "forced": bool(force)}))
