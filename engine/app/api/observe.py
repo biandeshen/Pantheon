@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import String, cast, func, or_, select
 
 from app.core.db import SessionLocal
@@ -196,9 +196,26 @@ async def stats(org_id: str, days: int = 14) -> dict[str, Any]:
 
 
 @router.get("/orgs/{org_id}/events")
-async def events(org_id: str, after: int = 0, limit: int = 1000,
+async def events(request: Request, org_id: str, after: int = 0, limit: int = 1000,
                  last: int | None = None) -> list[dict[str, Any]]:
-    """Events after ``after`` (catch-up), or the ``last`` N events (history)."""
+    """Events after ``after`` (catch-up), or the ``last`` N events (history).
+
+    Unknown query parameters are REFUSED rather than ignored. Measured need: an agent paginating
+    with ``?offset=9999&order=desc`` got HTTP 200 and seq 5, 6 -- the oldest rows -- and reasonably
+    concluded "no events exist", which turned two acceptance checks into false NOT_RUN verdicts.
+    Silently ignoring a parameter that looks like it controls the window is worse than rejecting
+    it, because the caller cannot tell "empty result" from "your parameter meant nothing".
+    """
+    known = {"after", "limit", "last"}
+    unknown = sorted(set(request.query_params.keys()) - known)
+    if unknown:
+        raise HTTPException(400, (
+            f"unknown query parameter(s): {', '.join(unknown)}. "
+            f"This endpoint accepts {', '.join(sorted(known))}: `after` = events after that "
+            "seq (catch-up), `last` = the N most recent events (history), `limit` = page size "
+            "for `after`. A window parameter that is not one of these returns nothing rather "
+            "than the rows you expect."
+        ))
     if last is not None:
         return await bus.recent(org_id, min(max(last, 1), 2000))
     return await bus.since(org_id, after, min(limit, 5000))
