@@ -643,7 +643,15 @@ _WRONG_SHELL = re.compile(
     "run_command",
     """Run a shell command in your workdir (build, test, git, scripts…). Returns the
 exit code and combined output. Long-running servers are not supported; the
-command is killed after `timeout` seconds."""
+command is killed after `timeout` seconds.
+
+`workdir` is where the command STARTS, not where it is confined. This is a real shell running as
+the same user as the engine, so a script you write can reach any path that user can reach and any
+host this machine can reach; `cwd` does not stop that and neither does the data-folder screening in
+core/guard.py, which says of itself "It is not a sandbox". Treat every command as user-level
+authority, and prefer read_file / search_files / list_dir / file_digest / check_files for anything
+that only reads -- they need no approval precisely because they cannot reach outside your
+workspace."""
     + ("""
 On Windows the command runs in the shell it's written for, and the result says which: one
 line in cmd.exe (&&, %VAR%, dir); PowerShell when it uses cmdlets or $variables
