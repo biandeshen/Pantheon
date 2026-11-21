@@ -354,16 +354,32 @@ class TaskEvent(Base):
 
 
 class Artifact(Base):
+    """A file an agent wrote, with the run that wrote it and the exact bytes it wrote.
+
+    ``task_id``/``turn_id`` are recorded, never inferred later: a receipt has to say which Run
+    produced this version, and "the run that was closest in time" is not that. Both stay NULL
+    for rows written before this column existed -- back-filling them from timestamps would
+    recreate exactly the inference this table exists to avoid.
+    """
+
     __tablename__ = "artifacts"
+    __table_args__ = (UniqueConstraint("org_id", "path", "sha256", name="uq_artifact_version"),)
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: new_id("art"))
     org_id: Mapped[str] = mapped_column(ForeignKey("orgs.id", ondelete="CASCADE"), index=True)
     agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    task_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    turn_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     path: Mapped[str] = mapped_column(String)
     title: Mapped[str] = mapped_column(String, default="")
     mime: Mapped[str] = mapped_column(String, default="text/plain")
     size: Mapped[int] = mapped_column(Integer, default=0)
+    # The engine hashes the bytes it just wrote; a hash the model reports is not a receipt.
+    sha256: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Where this version sat in a git checkout at write time: the commit, and whether the file
+    # still differed from it. NULL means "not in a git repo", never "clean".
+    source_sha: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_dirty: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = _ts()
 
 

@@ -27,6 +27,20 @@ def turn_to_dict(t: Turn) -> dict[str, Any]:
             "endedAt": t.ended_at.isoformat() if t.ended_at else None}
 
 
+async def artifacts_of_turn(session, turn_id: str) -> list[dict[str, Any]]:
+    """The versions this Run recorded as its product -- read from the artifact rows it wrote.
+
+    A receipt, not a reconstruction: nothing here is derived from timestamps, so a Run that wrote
+    no file returns an empty list and the caller must say "recorded nothing" rather than guess.
+    """
+    from app.models import Artifact
+    from app.services.artifacts import artifact_to_dict
+
+    rows = (await session.execute(select(Artifact).where(Artifact.turn_id == turn_id)
+                                  .order_by(Artifact.created_at))).scalars().all()
+    return [artifact_to_dict(a) for a in rows]
+
+
 def llm_to_dict(c: LlmCall, full: bool = False) -> dict[str, Any]:
     d = {"id": c.id, "turnId": c.turn_id, "agentId": c.agent_id, "purpose": c.purpose,
          "provider": c.provider, "model": c.model, "inputTokens": c.input_tokens,
@@ -79,11 +93,16 @@ async def get_turn(turn_id: str) -> dict[str, Any]:
         ).scalars().all()
         sent = (await session.execute(select(Message).where(Message.turn_id == turn_id)
                                       .order_by(Message.created_at))).scalars().all()
+        # What this Run produced, so a reader never has to infer it from when a commit appeared.
+        # Read inside the session on purpose: reusing a closed one opens a transaction that
+        # nothing commits, and on SQLite that holds the write lock for the rest of the request.
+        made = await artifacts_of_turn(session, turn_id)
     return turn_to_dict(t) | {
         "llmCalls": [llm_to_dict(c) for c in calls],
         "toolCalls": [tool_to_dict(x) for x in tools],
         "inbox": [message_to_dict(m) for m in trigger],
         "sent": [message_to_dict(m) for m in sent],
+        "artifacts": made,
     }
 
 

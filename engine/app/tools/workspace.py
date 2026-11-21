@@ -326,6 +326,11 @@ async def edit_file(args: dict, ctx: ToolContext) -> str:
             out = out.replace("\n", "\r\n") if crlf else out
             p.write_text(out, encoding="utf-8")
             _wrote(p)
+            # An edit is a new version of the artifact: record it like a write, or a Run that
+            # changed a file by editing leaves no receipt for what it produced.
+            from app.services import artifacts
+
+            await artifacts.record(ctx, p)
             return (f"Edited {_rel(ctx, p)} ({count} replacements) · version "
                     f"{remember(p, out, ctx.agent.id)}.")
         if count > 1:
@@ -376,6 +381,9 @@ async def edit_file(args: dict, ctx: ToolContext) -> str:
         p.write_text(final_text, encoding="utf-8")
         _wrote(p)
         final = remember(p, final_text, ctx.agent.id)
+        from app.services import artifacts
+
+        await artifacts.record(ctx, p)
     where = ", ".join(f"line {text.count(chr(10), 0, s) + 1}" for s, _, _ in spans)
     head = (f"Edited {_rel(ctx, p)}: {len(spans)} change{'s' * (len(spans) != 1)} ({where})"
             if spans else f"{_rel(ctx, p)} is unchanged")

@@ -223,10 +223,22 @@ async def _sole_org_id(session: Any) -> str:
 
 
 @router.get("/orgs/{org_id}/artifacts")
-async def list_artifacts(org_id: str) -> list[dict[str, Any]]:
+async def list_artifacts(org_id: str, task_id: str | None = None, turn_id: str | None = None,
+                         path: str | None = None) -> list[dict[str, Any]]:
+    """The versions agents wrote, newest first.
+
+    Filterable because a receipt is a lookup, not a scroll: a verdict names a task (or a Run) and
+    needs the versions bound to it, and "the newest 40 files in the org" cannot answer that.
+    """
     async with SessionLocal() as session:
-        rows = (await session.execute(select(Artifact).where(Artifact.org_id == org_id)
-                                      .order_by(Artifact.created_at.desc()))).scalars().all()
+        stmt = select(Artifact).where(Artifact.org_id == org_id)
+        if task_id:
+            stmt = stmt.where(Artifact.task_id == task_id)
+        if turn_id:
+            stmt = stmt.where(Artifact.turn_id == turn_id)
+        if path:
+            stmt = stmt.where(Artifact.path == path)
+        rows = (await session.execute(stmt.order_by(Artifact.created_at.desc()))).scalars().all()
     return [artifact_to_dict(a) for a in rows]
 
 
