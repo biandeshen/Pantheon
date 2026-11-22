@@ -544,3 +544,137 @@ async def test_two_restarts_write_the_downstream_result_once(app_client, monkeyp
 
     # One run is the claim; the status line above is not. A duplicate would show as a second Turn
     # and a second result write, which is what the counts assert.
+
+
+@pytest.mark.asyncio
+async def test_a_second_still_open_dependency_blocks_the_wake_up(app_client):
+    """Two dependencies, one closed: "all dependencies are done" would be false, so nothing is sent.
+
+    The earlier code looked only at the edge that fired. A task with two prerequisites would then be
+    told "you can start it now" while another prerequisite was still open -- a lie in the notice.
+    """
+    org = await make_org(app_client)
+    up = await make_agent(app_client, org["id"], "Up")
+    up2 = await make_agent(app_client, org["id"], "Up2")
+    down = await make_agent(app_client, org["id"], "Down")
+    a = await _mk_task(app_client, org["id"], title="dep A", assignee=up["id"])
+    b = await _mk_task(app_client, org["id"], title="dep B", assignee=up2["id"])
+    target = await _mk_task(app_client, org["id"], title="down", assignee=down["id"],
+                            depends_on=[a["id"], b["id"]])
+
+    await _close(app_client, a["id"])          # one of two
+    assert not await _followups(target["id"]), "not all dependencies are done yet"
+
+    await _close(app_client, b["id"])          # now the set is complete
+    # The live path delivers on the second close, so this asserts the OUTCOME, not which code path
+    # sent it: exactly one notice, and it exists. Asserting "the sweep sent it" would be testing the
+    # scheduler's timing rather than the rule.
+    notes = await _followups(target["id"])
+    assert len(notes) == 1, f"exactly one notice once the whole set closed, got {len(notes)}"
+    # And nothing further is owed or delivered.
+    again = await followups.sweep_followups()
+    assert again["sent"] == 0, again
+    assert len(await _followups(target["id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_but_never_sent_notice_can_be_issued_once_when_conditions_return(app_client):
+    """Cancelled is not "already delivered". If the reason holds again, it is owed once more."""
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+
+    # Cancel it WITHOUT ever delivering: a failed send leaves nothing delivered, which is the only
+    # honest way to reach "cancelled but never sent". Closing first would have delivered it.
+    note = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                       "dependencies-closed", [down["id"]], TEXT,
+                                       notify=lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+    assert note == "send-failed"
+    await followups.cancel(intent.id)
+    row = (await rows(FollowupIntent, FollowupIntent.id == intent.id))[0]
+    assert row.status == "cancelled" and row.message_id is None, "cancelled and never delivered"
+
+    # The conditions now hold (the dependency is closed), so it is owed once more.
+    async with SessionLocal() as session:
+        t = await session.get(Task, first["id"])
+        t.status = "done"
+        await session.commit()
+
+    counts = await followups.sweep_followups()
+    assert counts["sent"] == 1, counts
+    notes = await _followups(second["id"])
+    assert len(notes) == 1, "issued once when the conditions returned"
+    row = (await rows(FollowupIntent, FollowupIntent.id == intent.id))[0]
+    assert row.status == "sent"
+
+    # And never again: `sent` is the status that forbids a second delivery.
+    again = await followups.sweep_followups()
+    assert again["sent"] == 0, again
+    assert len(await _followups(second["id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_delivered_notice_is_never_reissued_even_if_the_dependency_reopens(app_client):
+    """The other side of the rule: sent means sent, whatever happens to the dependency afterwards."""
+    org, _up, _down, first, second = await _chain(app_client)
+    await _close(app_client, first["id"])
+    assert len(await _followups(second["id"])) == 1
+
+    await app_client.patch(f"/api/v1/tasks/{first['id']}", json={"status": "in_progress"})
+    counts = await followups.sweep_followups()
+    assert counts["sent"] == 0, counts
+    assert len(await _followups(second["id"])) == 1, "a delivered notice stays delivered"
+
+
+@pytest.mark.asyncio
+async def test_still_owed_refuses_while_another_dependency_is_open(app_client):
+    """Direct test of the guard. The end-to-end test cannot reach it: tasks.py already declines to
+    create the notice while any dependency is open, so the outcome is protected twice. This asserts
+    the second layer on its own -- otherwise deleting it changes nothing observable and nobody knows
+    whether it is doing anything.
+    """
+    org = await make_org(app_client)
+    up = await make_agent(app_client, org["id"], "Up")
+    down = await make_agent(app_client, org["id"], "Down")
+    a = await _mk_task(app_client, org["id"], title="dep A", assignee=up["id"])
+    b = await _mk_task(app_client, org["id"], title="dep B", assignee=up["id"])
+    target = await _mk_task(app_client, org["id"], title="down", assignee=down["id"],
+                            depends_on=[a["id"], b["id"]])
+    await _close(app_client, a["id"])
+    await _seed_owed(org["id"], a, target, down["id"])
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == target["id"]))[0]
+
+    async with SessionLocal() as session:
+        dependent = await session.get(Task, target["id"])
+        dependency = await session.get(Task, a["id"])
+        row = await session.get(FollowupIntent, intent.id)
+        owed, why = await followups._still_owed(row, dependent, dependency, session)
+    assert owed is False, "b is still open, so 'all dependencies are done' would be false"
+    assert "another dependency" in why
+
+
+@pytest.mark.asyncio
+async def test_claim_refuses_a_cancelled_row_unless_reissue_is_allowed(app_client):
+    """Direct test of the claim's status filter -- the layer the end-to-end test bypasses by
+    flipping the row to `created` first."""
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+    await followups.cancel(intent.id)
+
+    assert await followups.claim(intent.id) is False, "a cancelled row is not claimable by default"
+    assert await followups.claim(intent.id, allow_cancelled=True) is True
+
+
+@pytest.mark.asyncio
+async def test_claim_refuses_a_sent_row(app_client):
+    """`sent` must be unclaimable even with reissue allowed: that is what forbids a second delivery."""
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+    await followups.claim(intent.id)
+    await followups.mark_sent(intent.id, "msg_x")
+
+    assert await followups.claim(intent.id) is False
+    assert await followups.claim(intent.id, allow_cancelled=True) is False, \
+        "reissue permission covers cancelled, never sent"

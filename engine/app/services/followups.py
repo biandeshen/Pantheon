@@ -68,7 +68,7 @@ async def record_followups(session, org_id: str, intents: list[dict]) -> list[Fo
     return made
 
 
-async def claim(intent_id: str) -> bool:
+async def claim(intent_id: str, allow_cancelled: bool = False) -> bool:
     """Take exclusive responsibility for sending one intent. False means someone else has it.
 
     A conditional UPDATE, not a read-then-write: two callers (live send and sweep, or two sweeps)
@@ -76,9 +76,10 @@ async def claim(intent_id: str) -> bool:
     because restarts happened to be rare.
     """
     async with SessionLocal() as session:
+        reissuable = ("created", "cancelled") if allow_cancelled else ("created",)
         res = await session.execute(
             update(FollowupIntent)
-            .where(FollowupIntent.id == intent_id, FollowupIntent.status == "created")
+            .where(FollowupIntent.id == intent_id, FollowupIntent.status.in_(reissuable))
             .values(status="sending", attempts=FollowupIntent.attempts + 1)
         )
         await session.commit()
@@ -178,7 +179,8 @@ async def _find_tagged(session, row: FollowupIntent):
 
 
 async def deliver_one(org_id: str, dependency_id: str, dependent_id: str, reason: str,
-                      targets: list[str], text: str, *, depth: int = 0, notify=None) -> str:
+                      targets: list[str], text: str, *, depth: int = 0, notify=None,
+                      reissue_cancelled: bool = False) -> str:
     """Deliver one already-recorded intent. Returns the outcome for the caller's log.
 
     Idempotent by construction: it claims first, looks for an existing message second, and only then
@@ -198,8 +200,13 @@ async def deliver_one(org_id: str, dependency_id: str, dependent_id: str, reason
         intent_id = row.id
         if row.status == "sent":
             return "already-sent"
-        if row.status == "cancelled":
+        if row.status == "cancelled" and not reissue_cancelled:
             return "cancelled"
+        if row.status == "cancelled" and reissue_cancelled:
+            # The caller (sweep) already re-checked that the conditions hold again. Recorded as a
+            # re-issue so a reader can see this notice was owed twice, not sent twice in a row.
+            row.status, row.sent_at = "created", utcnow()
+            await session.commit()
 
     # A row stuck in `sending` is the crash-after-commit case, and it must be handled BEFORE the
     # claim -- `claim` only accepts `created`, so asking it first would report "someone else has it"
@@ -219,7 +226,7 @@ async def deliver_one(org_id: str, dependency_id: str, dependent_id: str, reason
         await release(intent_id)
         return "released-stale"
 
-    if not await claim(intent_id):
+    if not await claim(intent_id, allow_cancelled=reissue_cancelled):
         return "claimed-by-other"
 
     row = await _row(intent_id)
@@ -252,17 +259,35 @@ async def _row(intent_id: str) -> FollowupIntent | None:
         return await session.get(FollowupIntent, intent_id)
 
 
-def _still_owed(row: FollowupIntent, dependent: Task | None, dependency: Task | None) -> tuple[bool, str]:
-    """Is the reason still true? A stale follow-up is worse than none: it tells someone to start."""
+async def _still_owed(row: FollowupIntent, dependent: Task | None,
+                      dependency: Task | None, session=None) -> tuple[bool, str]:
+    """Is the reason still true, NOW?
+
+    The earlier version only glanced at the one dependency that happened to trigger it. Measured
+    problem: a task with two dependencies could be woken when the first closed and the second was
+    still open -- the notice says "all dependencies are done", which would then be false. So the
+    whole dependency set is checked, not the single edge that fired.
+
+    Cancelled rows come back through here too: if a notice was cancelled because the conditions
+    lapsed and they later hold again, it is legitimately owed once more (the "sent" status is what
+    forbids a second delivery, not "cancelled").
+    """
     if dependent is None:
         return False, "dependent task is gone"
     if dependent.status in CLOSED:
         return False, "dependent is already closed"
+    if not dependent.assignee_id:
+        return False, "dependent has no assignee to wake"
     if row.reason == "dependencies-closed":
         if dependency is not None and dependency.status not in CLOSED:
             return False, "dependency was reopened"
-        if not dependent.assignee_id:
-            return False, "dependent has no assignee to wake"
+        # Every dependency, not just this one. A partial rollout here would tell someone "all done"
+        # while another prerequisite is still open -- the notice would be a lie the moment it lands.
+        if session is not None and dependent.depends_on:
+            for dep_id in dependent.depends_on:
+                other = await session.get(Task, dep_id)
+                if other is not None and other.status not in CLOSED:
+                    return False, f"another dependency is still open ({other.id[-6:]})"
     if row.reason == "child-stop" and dependent.assignee_id is None:
         return False, "child has no assignee"
     return True, ""
@@ -274,8 +299,12 @@ async def sweep_followups(notify=None) -> dict[str, int]:
     async with SessionLocal() as session:
         # `sending` too: a row left in that state by a crash is exactly what the sweep exists for.
         # deliver_one decides whether it is adoptable, in flight, or stale -- the sweep does not guess.
+        # `cancelled` is included on purpose. A notice cancelled because its conditions lapsed is not
+        # the same as one that was delivered: if the conditions hold again, it is owed once. `sent`
+        # is the only status that permanently forbids another delivery, and it is never in this list.
         rows = (await session.execute(
-            select(FollowupIntent).where(FollowupIntent.status.in_(("created", "sending")))
+            select(FollowupIntent).where(
+                FollowupIntent.status.in_(("created", "sending", "cancelled")))
         )).scalars().all()
         pending = [(r.id, r.org_id, r.dependent_id, r.dependency_id, r.reason, r.text,
                     r.task_id, r.agent_id) for r in rows]
@@ -285,9 +314,9 @@ async def sweep_followups(notify=None) -> dict[str, int]:
             dependent = await session.get(Task, dependent_id)
             dependency = await session.get(Task, dependency_id) if dependency_id else None
             row = await session.get(FollowupIntent, intent_id)
-            if row is None or row.status not in ("created", "sending"):
+            if row is None or row.status not in ("created", "sending", "cancelled"):
                 continue
-            owed, why = _still_owed(row, dependent, dependency)
+            owed, why = await _still_owed(row, dependent, dependency, session)
             if not owed:
                 row.status = "cancelled"
                 await session.commit()
@@ -300,7 +329,7 @@ async def sweep_followups(notify=None) -> dict[str, int]:
             cancelled += 1
             continue
         outcome = await deliver_one(org_id, dependency_id, dependent_id, reason, [target], text,
-                                    notify=notify)
+                                    notify=notify, reissue_cancelled=True)
         if outcome == "sent":
             sent += 1
         elif outcome in ("claimed-by-other", "already-sent", "adopted-existing", "in-flight",
