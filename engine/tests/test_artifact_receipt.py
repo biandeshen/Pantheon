@@ -166,3 +166,60 @@ async def test_a_chat_turn_with_no_task_leaves_task_id_empty(app_client):
     assert chat.task_id is None, (
         f"a chat turn names no task; borrowing one would be a guess: task_id={chat.task_id!r}")
     assert chat.turn_id, "but the Run is still recorded"
+
+
+async def test_the_source_commit_is_captured_inside_a_git_checkout(app_client, tmp_path):
+    """sourceSha must be the commit the file sat on -- and null (not "clean") outside a repo.
+
+    Kit's T-67 receipt flagged sourceSha=null as an engine gap. It was not: the file was written at
+    the workspace root, which is not a checkout, and NULL is what the code promises there. This
+    test pins both halves so the next reader can tell a real gap from the documented NULL.
+    """
+    import subprocess
+
+    from app.models import Agent as AgentModel, Org
+    from app.tools.base import org_workspace
+
+    def git(*args, cwd):
+        subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+
+    org = await make_org(app_client)
+    agent = await make_agent(app_client, org["id"], "Ann")
+    repo = org_workspace((await rows(Org, Org.id == org["id"]))[0]) / "checkout"
+    repo.mkdir()
+    git("init", "-q", cwd=repo)
+    git("config", "user.email", "t@example.com", cwd=repo)
+    git("config", "user.name", "T", cwd=repo)
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    git("add", ".", cwd=repo)
+    git("commit", "-q", "-m", "seed", cwd=repo)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True,
+                          text=True, check=True).stdout.strip()
+
+    before = len(await rows(Turn, Turn.agent_id == agent["id"]))
+    script(agent["id"], calls(("write_file", {"path": "checkout/notes.md", "content": "n\n"})),
+           say("ok"))
+    await dm(app_client, org["id"], "Ann", "write in the checkout")
+
+    async def done() -> bool:
+        return len([t for t in await rows(Turn, Turn.agent_id == agent["id"])
+                    if t.status in ("completed", "failed")]) > before
+
+    await wait_for(done, msg="turn", timeout=30)
+
+    inside = (await rows(Artifact, Artifact.path == "checkout/notes.md"))[0]
+    assert inside.source_sha == head, (
+        f"the file sits on commit {head[:7]}; the receipt must say so: {inside.source_sha}")
+    assert inside.source_dirty is True, "a new untracked file differs from the commit"
+
+    # The same turn's file outside any checkout: null, and that means "no repo", not "clean".
+    script(agent["id"], calls(("write_file", {"path": "loose.md", "content": "l\n"})), say("ok"))
+    await dm(app_client, org["id"], "Ann", "write at the root")
+
+    async def done2() -> bool:
+        return len([t for t in await rows(Turn, Turn.agent_id == agent["id"])
+                    if t.status in ("completed", "failed")]) > before + 1
+
+    await wait_for(done2, msg="second turn", timeout=30)
+    outside = (await rows(Artifact, Artifact.path == "loose.md"))[0]
+    assert outside.source_sha is None and outside.source_dirty is None
