@@ -67,6 +67,36 @@ async def _followups(task_id: str) -> list[Message]:
     return [m for m in await rows(Message, Message.task_id == task_id) if _is_followup(m)]
 
 
+async def _writebacks(task_id: str, turn_id: str) -> list:
+    """Successful `update_task` calls this run made against this task, counted from tool_calls.
+
+    This exists because `task.result` cannot answer the question. It stores the last value written, so
+    two identical write-backs leave a single occurrence in the string -- a test that counts occurrences
+    passes while the duplicate it is meant to catch sits right there. Counting the CALLS is what can
+    tell "wrote once" from "wrote twice with the same text".
+    """
+    from app.models import ToolCall
+
+    ref = None
+    task = (await rows(Task, Task.id == task_id))
+    if task:
+        from app.services.tasks import task_ref
+
+        ref = task_ref(task[0])
+
+    out = []
+    for tc in await rows(ToolCall, ToolCall.turn_id == turn_id, ToolCall.name == "update_task"):
+        if tc.status != "ok":
+            continue
+        args = tc.args or {}
+        if args.get("task") not in (ref, task_id):
+            continue
+        if args.get("result") is None:
+            continue
+        out.append(tc)
+    return out
+
+
 async def _chain(client, *, with_script: bool = False):
     """Two agents, one upstream task, one downstream task that depends on it."""
     org = await make_org(client)
@@ -756,6 +786,14 @@ async def test_the_woken_task_produces_and_writes_back_exactly_once(app_client):
     assert task.result and task.result.count("second order delivered") == 1, (
         f"the result was written once: {task.result!r}")
 
+    # The string count above is NOT proof, and the next test shows why: `result` holds only the last
+    # value written, so two identical writes leave `count == 1`. The number that can distinguish them
+    # is how many write-backs the SAME task received from the SAME run.
+    writes = await _writebacks(second["id"], runs[0].id)
+    assert len(writes) == 1, (
+        f"exactly one update_task write-back from the woken run, got {len(writes)}: "
+        f"{[w.args.get('result') for w in writes]}")
+
     notes = await _followups(second["id"])
     assert len(notes) == 1, "and still one notice, not one per restart"
 
@@ -784,3 +822,55 @@ async def test_a_woken_task_that_produces_nothing_is_not_counted_as_delivered(ap
     assert not task.result, "and recorded no result"
     # The point: one completed run exists, and it is still not a delivered order.
     assert not (runs and task.result), "a run is not a delivery"
+
+
+@pytest.mark.asyncio
+async def test_two_identical_write_backs_are_caught_even_though_result_reads_once(app_client):
+    """The assertion that was missing: `result.count()` cannot see a duplicate with the same text.
+
+    `task.result` stores only the last value written, so writing "second order delivered" twice leaves
+    exactly one occurrence in the string. A test asserting `count(...) == 1` therefore passes while the
+    duplicate sits in the table -- it is asserting on the wrong evidence.
+
+    This test makes the duplicate happen on purpose and asserts BOTH halves:
+      result.count(...) == 1        the string really is blind to it (so the old assertion proved nothing)
+      len(writebacks)   == 2        counting the calls does catch it
+    """
+    org = await make_org(app_client)
+    up = await make_agent(app_client, org["id"], "Up")
+    down = await make_agent(app_client, org["id"], "Down")
+    first = await _mk_task(app_client, org["id"], title="upstream", assignee=up["id"])
+    second = await _mk_task(app_client, org["id"], title="downstream", assignee=down["id"],
+                            depends_on=[first["id"]])
+
+    from tests.helpers import calls
+
+    # Deliberately writes the SAME result twice. A real duplicate looks exactly like this.
+    script(down["id"],
+           calls(("write_file", {"path": "dup-order.md", "content": "one product\n"})),
+           calls(("update_task", {"task": second["ref"], "result": "second order delivered"})),
+           calls(("update_task", {"task": second["ref"], "result": "second order delivered"})),
+           say("done"))
+
+    await _close(app_client, first["id"])
+
+    async def done() -> bool:
+        t = (await rows(Task, Task.id == second["id"]))[0]
+        return bool(t.result and "second order delivered" in t.result)
+
+    await wait_for(done, msg="result written", timeout=40)
+    # Let the second call land too, if the engine would accept it.
+    await asyncio.sleep(1.5)
+
+    runs = await rows(Turn, Turn.agent_id == down["id"])
+    assert len(runs) == 1, f"one run, got {len(runs)}"
+
+    task = (await rows(Task, Task.id == second["id"]))[0]
+    assert task.result.count("second order delivered") == 1, (
+        "the string count is blind to a same-value duplicate -- which is why it cannot be the "
+        f"assertion: {task.result!r}")
+
+    writes = await _writebacks(second["id"], runs[0].id)
+    assert len(writes) == 2, (
+        f"counting the calls sees both write-backs, got {len(writes)}: "
+        f"{[w.args.get('result') for w in writes]}")
