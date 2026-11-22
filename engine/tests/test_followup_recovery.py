@@ -1,18 +1,27 @@
-"""T-57's other half: the wake-up that a crash between "close saved" and "notice sent" used to lose.
+"""T-57's other half: the wake-up a crash between "close saved" and "notice sent" used to lose.
 
-Production evidence this fixes, not a simulation: T-52 closed at 2026-11-20T15:27:27, and T-53 -- the
-task whose only dependency was T-52 -- has received nothing since. Its single message predates the
-close by thirteen hours. So the window is real and the loss is real.
+Production evidence this fixes, not a simulation: T-52 closed at 2026-11-20T15:27:27, and T-53 -- whose
+only dependency was T-52 -- has received nothing since (its single message predates the close by
+thirteen hours).
 
-Two things must hold, and they are opposites, so both are asserted:
+Three failure modes, and the first version of this file only appeared to cover them:
 
-  1. the wake-up is not lost   -> a close whose notice never went out is finished by the sweep
-  2. the wake-up is not doubled -> a notice that did go out is never sent again, and the same
-                                  dependency closing twice produces one notice
+  1. closed with NO record        the close committed, the intent written in a second transaction.
+                                  That version corrupted the database and inserted the intent by hand,
+                                  so it recreated the state by fiat -- it proved the sweep works, not
+                                  that the window is closed. Now the crash is injected at the real
+                                  boundary and the assertion is on what the CLOSE itself left.
+  2. sent but not marked, or two  the notice lands, the process dies before mark_sent, and the sweep
+     senders racing              sends it again. Covered by a conditional claim plus adopting an
+                                  existing message instead of creating a second one.
+  3. recorded, never sent         a plain crash after commit. A restart finishes it.
 
-Note on scope: this is the engine's behaviour against a test database. The production task T-53 is
-NOT used as a restart reproduction -- it has no assignee, so no wake-up was ever possible for it, and
-claiming otherwise would be inventing evidence.
+Every test drives the REAL path (HTTP PATCH -> tasks.update). Nothing is written into
+`followup_intents` by hand except where the assertion is specifically about a row in that state.
+
+The chain, per the review note: one dependency-notice id threads through the delivery, the successful
+turn, and one persisted result. Creation notices are excluded -- creating a task also notifies its
+assignee, so counting "any notification" would credit the wrong event.
 """
 
 from __future__ import annotations
@@ -22,10 +31,13 @@ from sqlalchemy import select
 
 from app.agents import runtime as runtime_mod
 from app.core.db import SessionLocal
-from app.models import Delivery, FollowupIntent, Message, Task
+from app.models import Delivery, FollowupIntent, Message, Task, Turn
 from app.services import followups
+from app.services.comms import notify as real_notify
 from tests.conftest import wait_for
-from tests.helpers import make_agent, make_org, rows
+from tests.helpers import make_agent, make_org, rows, say, script
+
+TEXT = "All dependencies are done. You can start it now."
 
 
 async def _mk_task(client, org_id: str, *, title: str, assignee: str | None, depends_on=None) -> dict:
@@ -44,137 +56,92 @@ async def _close(client, task_id: str, *, result: str = "accepted") -> None:
     assert r.status_code == 200, r.text
 
 
-async def _followup_messages(task_id: str) -> list[Message]:
-    msgs = await rows(Message, Message.task_id == task_id)
-    return [m for m in msgs if m.kind == "notification" and "dependencies" in (m.content or "").lower()]
+def _is_followup(m: Message) -> bool:
+    """The dependency-closed notice. NOT the one sent when a task is created."""
+    return m.kind == "notification" and "dependencies" in (m.content or "").lower()
+
+
+async def _followups(task_id: str) -> list[Message]:
+    return [m for m in await rows(Message, Message.task_id == task_id) if _is_followup(m)]
+
+
+async def _chain(client, *, with_script: bool = False):
+    """Two agents, one upstream task, one downstream task that depends on it."""
+    org = await make_org(client)
+    up = await make_agent(client, org["id"], "Up")
+    down = await make_agent(client, org["id"], "Down")
+    first = await _mk_task(client, org["id"], title="up", assignee=up["id"])
+    second = await _mk_task(client, org["id"], title="down", assignee=down["id"],
+                            depends_on=[first["id"]])
+    if with_script:
+        script(down["id"], say("downstream ran after the dependency closed"))
+    return org, up, down, first, second
+
+
+class CrashAtSend:
+    """Interrupt the real path between the commit and the send.
+
+    Because the close and the intent are now written in ONE transaction, what survives is exactly
+    what a real crash leaves: status done, intent row `created`, nothing delivered.
+    """
+
+    def __init__(self):
+        self.armed = True
+        self.raised = False
+
+    async def __call__(self, org_id, agent_ids, content, **kwargs):
+        if self.armed and "dependencies" in (content or "").lower():
+            self.armed = False
+            self.raised = True
+            raise RuntimeError("simulated crash between commit and send")
+        return await real_notify(org_id, agent_ids, content, **kwargs)
+
+
+async def _seed_owed(org_id: str, first: dict, second: dict, agent_id: str) -> None:
+    """A row in the state a crash leaves. Used only where the assertion is about that state."""
+    async with SessionLocal() as session:
+        session.add(FollowupIntent(org_id=org_id, dependency_id=first["id"],
+                                   dependent_id=second["id"], agent_id=agent_id,
+                                   reason="dependencies-closed", text=TEXT,
+                                   task_id=second["id"], status="created"))
+        await session.commit()
 
 
 @pytest.mark.asyncio
-async def test_a_close_records_the_intent_before_it_sends(app_client):
-    """The durable record must exist and end up `sent`, tied to the message that was delivered."""
-    org = await make_org(app_client)
-    up = await make_agent(app_client, org["id"], "Up")
-    down = await make_agent(app_client, org["id"], "Down")
-    first = await _mk_task(app_client, org["id"], title="up", assignee=up["id"])
-    second = await _mk_task(app_client, org["id"], title="down", assignee=down["id"],
-                            depends_on=[first["id"]])
+async def test_the_close_and_its_record_land_together(app_client):
+    """One transaction: closing a dependency and owing the wake-up are the same fact."""
+    org, _up, _down, first, second = await _chain(app_client)
 
     await _close(app_client, first["id"])
 
     intents = await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"])
     assert len(intents) == 1, f"exactly one intent for one dependency closing, got {len(intents)}"
     row = intents[0]
-    assert row.status == "sent"
-    assert row.message_id, "and it points at the notice that was actually delivered"
-    assert row.reason == "dependencies-closed"
-
-    notes = await _followup_messages(second["id"])
+    assert row.status == "sent", "the live path sends it too, and settles the row"
+    notes = await _followups(second["id"])
     assert len(notes) == 1
-    assert row.message_id == notes[0].id
+    assert row.message_id == notes[0].id, "the row points at the message that actually went out"
 
 
 @pytest.mark.asyncio
-async def test_the_interrupted_close_is_finished_by_the_sweep_exactly_once(app_client):
-    """Crash between the two: status committed, no notice, intent left `created`."""
-    org = await make_org(app_client)
-    up = await make_agent(app_client, org["id"], "Up")
-    down = await make_agent(app_client, org["id"], "Down")
-    first = await _mk_task(app_client, org["id"], title="up", assignee=up["id"])
-    second = await _mk_task(app_client, org["id"], title="down", assignee=down["id"],
-                            depends_on=[first["id"]])
+async def test_a_crash_between_commit_and_send_is_recovered_from_the_real_path(app_client,
+                                                                             monkeypatch):
+    """Inject the crash where it happens, then let a restart finish the job."""
+    org, _up, down, first, second = await _chain(app_client)
 
-    # Reproduce the window: close in the database (the commit that survives) and record the intent,
-    # but never send. That is exactly the state a process death here leaves behind.
-    async with SessionLocal() as session:
-        t = await session.get(Task, first["id"])
-        t.status = "done"
-        t.result = "accepted"
-        await session.commit()
-    await followups.record_followups(org["id"], [{
-        "dependency_id": first["id"], "dependent_id": second["id"], "agent_id": down["id"],
-        "reason": "dependencies-closed",
-        "text": f"All dependencies of {second['ref']} are done. You can start it now.",
-        "task_id": second["id"],
-    }])
+    crash = CrashAtSend()
+    monkeypatch.setattr("app.services.tasks.comms.notify", crash)
+    await _close(app_client, first["id"])
+    assert crash.raised, "the crash must have fired, or this test proves nothing"
+    monkeypatch.undo()
 
-    assert await followups.owed_count(org["id"]) == 1
-    assert not await _followup_messages(second["id"]), "precondition: nothing was sent"
-
-    counts = await followups.sweep_followups()
-    assert counts["sent"] == 1, counts
-    assert await followups.owed_count(org["id"]) == 0
-
-    notes = await _followup_messages(second["id"])
-    assert len(notes) == 1, "the lost wake-up is recovered"
-
-    # ...and a second sweep must not send it again.
-    counts2 = await followups.sweep_followups()
-    assert counts2["sent"] == 0, "already sent, so nothing more is owed"
-    assert len(await _followup_messages(second["id"])) == 1, "and it was not delivered twice"
-
-
-@pytest.mark.asyncio
-async def test_closing_the_same_dependency_twice_produces_one_notice(app_client):
-    """The unique key is the exactly-once guarantee; re-recording must be a no-op, not a duplicate."""
-    org = await make_org(app_client)
-    up = await make_agent(app_client, org["id"], "Up")
-    down = await make_agent(app_client, org["id"], "Down")
-    first = await _mk_task(app_client, org["id"], title="up", assignee=up["id"])
-    second = await _mk_task(app_client, org["id"], title="down", assignee=down["id"],
-                            depends_on=[first["id"]])
-
-    intent = {"dependency_id": first["id"], "dependent_id": second["id"], "agent_id": down["id"],
-              "reason": "dependencies-closed", "text": "deps done", "task_id": second["id"]}
-    made1 = await followups.record_followups(org["id"], [intent])
-    made2 = await followups.record_followups(org["id"], [intent])
-    assert len(made1) == 1
-    assert len(made2) == 0, "the second record hits the unique key and is skipped, not duplicated"
-    assert len(await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"])) == 1
-
-
-@pytest.mark.asyncio
-async def test_a_stale_wake_up_is_cancelled_not_delivered(app_client):
-    """If the dependent is already closed, telling someone to start it would be wrong."""
-    org = await make_org(app_client)
-    up = await make_agent(app_client, org["id"], "Up")
-    down = await make_agent(app_client, org["id"], "Down")
-    first = await _mk_task(app_client, org["id"], title="up", assignee=up["id"])
-    second = await _mk_task(app_client, org["id"], title="down", assignee=down["id"],
-                            depends_on=[first["id"]])
-    await followups.record_followups(org["id"], [{
-        "dependency_id": first["id"], "dependent_id": second["id"], "agent_id": down["id"],
-        "reason": "dependencies-closed", "text": "start now", "task_id": second["id"]}])
-
-    async with SessionLocal() as session:
-        t = await session.get(Task, second["id"])
-        t.status = "done"
-        await session.commit()
-
-    counts = await followups.sweep_followups()
-    assert counts["sent"] == 0 and counts["cancelled"] == 1, counts
-    assert not await _followup_messages(second["id"]), "a stale instruction must not reach anyone"
-    row = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
-    assert row.status == "cancelled"
-
-
-@pytest.mark.asyncio
-async def test_a_restart_finishes_what_the_crash_left_owed(app_client):
-    """The real path: nothing calls the sweep by hand -- starting the runtime does it."""
-    org = await make_org(app_client)
-    up = await make_agent(app_client, org["id"], "Up")
-    down = await make_agent(app_client, org["id"], "Down")
-    first = await _mk_task(app_client, org["id"], title="up", assignee=up["id"])
-    second = await _mk_task(app_client, org["id"], title="down", assignee=down["id"],
-                            depends_on=[first["id"]])
-
-    async with SessionLocal() as session:
-        t = await session.get(Task, first["id"])
-        t.status = "done"
-        await session.commit()
-    await followups.record_followups(org["id"], [{
-        "dependency_id": first["id"], "dependent_id": second["id"], "agent_id": down["id"],
-        "reason": "dependencies-closed", "text": "All dependencies are done. You can start it now.", "task_id": second["id"]}])
-    assert await followups.owed_count(org["id"]) == 1
+    # What the interrupted close left: closed, owed, unsent -- and the record came from the close
+    # itself, not from the test.
+    assert (await rows(Task, Task.id == first["id"]))[0].status == "done"
+    intents = await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"])
+    assert len(intents) == 1, "the record is there because it committed WITH the close"
+    assert intents[0].status == "created", "and it is still owed, not lost"
+    assert not await _followups(second["id"]), "precondition: nothing was delivered"
 
     fresh = runtime_mod.Runtime()
     runtime_mod.runtime = fresh
@@ -183,17 +150,183 @@ async def test_a_restart_finishes_what_the_crash_left_owed(app_client):
     await fresh.start()
     try:
         async def delivered() -> bool:
-            return bool(await _followup_messages(second["id"]))
+            return bool(await _followups(second["id"]))
 
-        await wait_for(delivered, msg="recovered follow-up after restart", timeout=20)
-        assert len(await _followup_messages(second["id"])) == 1
+        await wait_for(delivered, msg="recovered follow-up", timeout=20)
+        assert len(await _followups(second["id"])) == 1, "recovered once"
         assert await followups.owed_count(org["id"]) == 0
-        # And the delivery exists, so the wake-up reaches an agent rather than only a table.
-        msgs = await _followup_messages(second["id"])
-        ds = await rows(Delivery, Delivery.message_id == msgs[0].id)
-        assert ds and all(d.status in ("pending", "done", "claimed") for d in ds)
     finally:
         await fresh.stop()
+
+
+@pytest.mark.asyncio
+async def test_recovering_twice_does_not_send_twice(app_client, monkeypatch):
+    """Restart, then restart again: the second sweep must find nothing to do."""
+    org, _up, _down, first, second = await _chain(app_client)
+    crash = CrashAtSend()
+    monkeypatch.setattr("app.services.tasks.comms.notify", crash)
+    await _close(app_client, first["id"])
+    monkeypatch.undo()
+    assert crash.raised
+
+    first_sweep = await followups.sweep_followups()
+    assert first_sweep["sent"] == 1, first_sweep
+    second_sweep = await followups.sweep_followups()
+    assert second_sweep["sent"] == 0, second_sweep
+    assert len(await _followups(second["id"])) == 1, "one notice, however many sweeps run"
+
+
+@pytest.mark.asyncio
+async def test_two_callers_cannot_both_deliver_one_intent(app_client):
+    """The claim is a conditional UPDATE: the database decides, not timing."""
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+
+    a = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                    "dependencies-closed", [down["id"]], TEXT)
+    b = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                    "dependencies-closed", [down["id"]], TEXT)
+    assert {a, b} == {"sent", "already-sent"}, (a, b)
+    assert len(await _followups(second["id"])) == 1, "two callers, one notice"
+
+
+@pytest.mark.asyncio
+async def test_the_claim_is_exclusive_even_side_by_side(app_client):
+    """The mechanism itself: one conditional UPDATE wins, the other reports the row is taken.
+
+    This exists because the previous version of the concurrency test drove two SEQUENTIAL calls,
+    which passed whether or not the claim was conditional -- the second call simply saw status
+    `sent` in its read. Asserting on `claim()` directly is the only way to pin the race.
+    """
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+
+    first_claim = await followups.claim(intent.id)
+    second_claim = await followups.claim(intent.id)
+    assert first_claim is True, "the first claimant takes it"
+    assert second_claim is False, "and the second must be told no, not silently allowed"
+    row = (await rows(FollowupIntent, FollowupIntent.id == intent.id))[0]
+    assert row.status == "sending" and row.attempts == 1, "one claim, one attempt"
+
+
+@pytest.mark.asyncio
+async def test_a_sender_that_loses_the_claim_does_not_send(app_client):
+    """If the row is already claimed, deliver_one must return without sending anything."""
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+    assert await followups.claim(intent.id) is True
+
+    outcome = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                          "dependencies-closed", [down["id"]], TEXT)
+    assert outcome == "claimed-by-other", outcome
+    assert not await _followups(second["id"]), "the loser must not send"
+
+
+@pytest.mark.asyncio
+async def test_a_notice_that_landed_but_was_not_marked_is_adopted_not_resent(app_client):
+    """The nastiest window: the message exists, the row still says `created`."""
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+
+    assert await followups.deliver_one(org["id"], first["id"], second["id"],
+                                       "dependencies-closed", [down["id"]], TEXT) == "sent"
+    sent_msg = (await _followups(second["id"]))[0]
+
+    # Rewind the row: the send happened, the marking did not.
+    async with SessionLocal() as session:
+        row = (await session.execute(select(FollowupIntent).where(
+            FollowupIntent.dependent_id == second["id"]))).scalars().one()
+        row.status, row.message_id = "created", sent_msg.id
+        await session.commit()
+
+    again = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                        "dependencies-closed", [down["id"]], TEXT)
+    assert again == "adopted-existing", again
+    assert len(await _followups(second["id"])) == 1, "adopted the existing message, did not resend"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_send_stays_owed_rather_than_vanishing(app_client):
+    """`sending` without a release would be the same loss in a new costume."""
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+
+    async def boom(*a, **k):
+        raise RuntimeError("channel down")
+
+    outcome = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                          "dependencies-closed", [down["id"]], TEXT, notify=boom)
+    assert outcome == "send-failed"
+    assert await followups.owed_count(org["id"]) == 1, "still owed, not stranded in `sending`"
+
+    recovered = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                            "dependencies-closed", [down["id"]], TEXT)
+    assert recovered == "sent", "and the next attempt can take it"
+
+
+@pytest.mark.asyncio
+async def test_the_notice_id_threads_delivery_turn_and_one_persisted_result(app_client):
+    """The chain the review asked for: one id -> delivery -> completed turn -> one result row."""
+    org, _up, down, first, second = await _chain(app_client, with_script=True)
+
+    await _close(app_client, first["id"])
+
+    notes = await _followups(second["id"])
+    assert len(notes) == 1, "creation notices are excluded by _is_followup"
+    notice = notes[0]
+
+    async def woke() -> bool:
+        return bool(await rows(Turn, Turn.agent_id == down["id"], Turn.status == "completed"))
+
+    await wait_for(woke, msg="downstream turn", timeout=30)
+
+    turns = await rows(Turn, Turn.agent_id == down["id"])
+    assert len(turns) == 1, f"one wake-up, not {len(turns)}"
+    turn = turns[0]
+
+    delivs = await rows(Delivery, Delivery.message_id == notice.id)
+    assert len(delivs) == 1, "one delivery per message, never two"
+    assert delivs[0].turn_id == turn.id, "the notice id leads to the turn it actually caused"
+
+    row = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+    assert row.status == "sent"
+    assert row.message_id == notice.id
+    assert row.attempts == 1, f"sent once, so one attempt, got {row.attempts}"
+
+
+@pytest.mark.asyncio
+async def test_closing_the_same_dependency_twice_produces_one_notice(app_client):
+    org, _up, _down, first, second = await _chain(app_client)
+
+    await _close(app_client, first["id"])
+    await app_client.patch(f"/api/v1/tasks/{first['id']}", json={"status": "in_progress"})
+    await _close(app_client, first["id"])
+
+    intents = await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"])
+    assert len(intents) == 1, "the unique key swallows the repeat"
+    assert len(await _followups(second["id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stale_wake_up_is_cancelled_not_delivered(app_client, monkeypatch):
+    org, _up, _down, first, second = await _chain(app_client)
+
+    crash = CrashAtSend()
+    monkeypatch.setattr("app.services.tasks.comms.notify", crash)
+    await _close(app_client, first["id"])
+    monkeypatch.undo()
+    assert crash.raised
+
+    async with SessionLocal() as session:
+        t = await session.get(Task, second["id"])
+        t.status = "done"
+        await session.commit()
+
+    counts = await followups.sweep_followups()
+    assert counts["sent"] == 0 and counts["cancelled"] == 1, counts
+    assert not await _followups(second["id"]), "a stale instruction must not reach anyone"
 
 
 @pytest.mark.asyncio
@@ -201,7 +334,8 @@ async def test_recovery_releases_a_claimed_delivery_without_duplicating_it(app_c
     """The other interrupted state: claimed, then the process died. No loss, no second row."""
     org = await make_org(app_client)
     worker = await make_agent(app_client, org["id"], "Worker")
-    task = await _mk_task(app_client, org["id"], title="claimed then crashed", assignee=worker["id"])
+    task = await _mk_task(app_client, org["id"], title="claimed then crashed",
+                          assignee=worker["id"])
     r = await app_client.post(f"/api/v1/orgs/{org['id']}/messages",
                               json={"to": "Worker", "content": "do it"})
     assert r.status_code == 201

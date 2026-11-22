@@ -487,7 +487,6 @@ async def update_task(
                                     data={"text": comment[:4000]}))
         for ev in events:
             session.add(ev)
-        await session.commit()
 
         # (targets, text, dependent task id, reason, dependency that closed)
         owed_notices: list[tuple[list[str], str, str | None, str, str]] = []
@@ -536,6 +535,25 @@ async def update_task(
                                       "and cancel it unless it still matters.", child.id,
                                       "child-stop", task.id))
 
+        # ONE COMMIT for the close and the record of what it owes.
+        #
+        # The first version committed the close here and wrote the intents in a second transaction
+        # after the sends (app/services/followups.py) -- which left exactly the window it was meant
+        # to close: a crash in between produced a closed dependency with no durable record, and the
+        # test passed only because it wrote the intent by hand after corrupting the database. A test
+        # that manufactures the state it is supposed to recover is not a test of the recovery.
+        #
+        # So the intent rows are added to THIS session, before the commit below. Either both land or
+        # neither does; "closed with no record" stops being a reachable state.
+        intent_rows = await followups.record_followups(session, org_id, [
+            {"dependency_id": dep_id, "dependent_id": dependent_id,
+             "agent_id": next((t for t in targets if t and t != actor.id), None),
+             "reason": reason, "text": text, "task_id": dependent_id}
+            for targets, text, dependent_id, reason, dep_id in owed_notices
+        ])
+        await session.commit()
+        _ = intent_rows
+
     if comment:
         comment_msg = await comms.post(
             org_id, actor, comment, to_agents=[
@@ -551,30 +569,21 @@ async def update_task(
     for targets, text, wake in notices:
         await comms.notify(org_id, [t for t in targets if t and t != actor.id], text,
                            depth=actor.depth, task_id=task.id, wake=wake)
-    # Write down what we owe BEFORE sending it.
+    # Send the notices the committed transaction recorded as owed.
     #
-    # The close is already committed above; the notice is a separate operation. Anything that stops
-    # the process between the two -- or any close that bypasses this function entirely -- used to
-    # leave a closed dependency and no wake-up, with nothing to re-derive it. Measured in production:
-    # T-52 closed 2026-11-20T15:27:27, and T-53 has received nothing since.
+    # The rows already exist (same commit as the close). This loop only delivers, and settles each
+    # row to `sent` or leaves it `created` for the sweep -- never inserts, so a duplicate row cannot
+    # be created here, and a lost race cannot produce a second notice.
     #
-    # The intent row is the durable record; the sweep in app.services.followups finishes what a crash
-    # interrupted, and the unique key makes "this dependency closed" produce one notice, not two.
-    owed = await followups.record_followups(org_id, [
-        {"dependency_id": dep_id, "dependent_id": dependent_id,
-         "agent_id": next((t for t in targets if t and t != actor.id), None),
-         "reason": reason, "text": text, "task_id": dependent_id}
-        for targets, text, dependent_id, reason, dep_id in owed_notices
-    ])
-    by_key = {(r.dependent_id, r.reason, r.dependency_id): r for r in owed}
-    for targets, text, dependent_id, reason, dep_id in owed_notices:
-        row = by_key.get((dependent_id, reason, dep_id))
-        msg = await comms.notify(org_id, [t for t in targets if t and t != actor.id], text,
-                                 depth=actor.depth, task_id=dependent_id)
-        # Marked sent only after the notice exists; if this line is never reached, the row stays
-        # `created` and the sweep will send it.
-        if row is not None and msg is not None:
-            await followups.mark_sent(row.id, getattr(msg, "id", None))
+    # Previously this called record_followups() first and then sent only when the insert had "won",
+    # which meant: if the row already existed (another writer got there first) the notice was never
+    # sent by anyone, and the row sat `created` until a restart. Now the settle step is unconditional
+    # and idempotent: the sweep re-reads status, so a double send is refused there.
+    if owed_notices:
+        for targets, text, dependent_id, reason, dep_id in owed_notices:
+            await followups.deliver_one(org_id, dep_id, dependent_id, reason,
+                                        [t for t in targets if t and t != actor.id],
+                                        text, depth=actor.depth)
     _ = comment_msg
     return task
 

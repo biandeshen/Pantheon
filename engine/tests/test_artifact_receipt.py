@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import hashlib
 
-from app.models import Artifact, Turn
+from app.models import Artifact, Org, Turn
 from app.services import tasks
 from app.services.comms import Sender
 from tests.conftest import wait_for
@@ -143,14 +143,25 @@ async def test_two_versions_of_one_path_stay_two_receipts(app_client):
         "two versions must not share a digest, or the first one is unrecoverable")
 
 
-async def test_writing_the_same_bytes_twice_is_one_row(app_client):
-    """Otherwise the file list fills with copies of one file and the receipt stops meaning anything."""
+async def test_the_same_bytes_in_two_runs_are_two_receipts_not_one(app_client):
+    """This test used to assert the opposite, and that assertion WAS the bug.
+
+    It required one row when two different Runs wrote identical bytes, which forced `record()` to
+    overwrite the first row's turn_id -- so the earlier Run's receipt vanished and its P0-3 became a
+    hole for no reason. "Don't fill the list with copies" is right for one Run retrying; it is wrong
+    across Runs, where each Run really did produce those bytes and must be able to say so.
+
+    The dedupe that still matters -- one Run writing the same bytes twice -- is asserted separately
+    (`test_the_same_run_writing_the_same_bytes_twice_is_one_row`).
+    """
     org = await make_org(app_client)
     agent = await make_agent(app_client, org["id"], "Ann")
-    await _run_writing(app_client, org["id"], agent, "same\n")
-    await _run_writing(app_client, org["id"], agent, "same\n")
+    first = await _run_writing(app_client, org["id"], agent, "same\n")
+    second = await _run_writing(app_client, org["id"], agent, "same\n")
 
-    assert len(await rows(Artifact, Artifact.path == "out.md")) == 1
+    rows_ = await rows(Artifact, Artifact.path == "out.md")
+    assert len(rows_) == 2, f"two Runs, two receipts: {[(r.turn_id, r.sha256) for r in rows_]}"
+    assert {r.turn_id for r in rows_} == {first, second}
 
 
 async def test_a_chat_turn_with_no_task_leaves_task_id_empty(app_client):
@@ -223,3 +234,60 @@ async def test_the_source_commit_is_captured_inside_a_git_checkout(app_client, t
     await wait_for(done2, msg="second turn", timeout=30)
     outside = (await rows(Artifact, Artifact.path == "loose.md"))[0]
     assert outside.source_sha is None and outside.source_dirty is None
+
+
+async def test_two_runs_writing_identical_bytes_each_keep_their_receipt(app_client):
+    """Measured bug: the second byte-identical write moved the first Run's turn_id away.
+
+    The unique key was (org, path, sha256), so `record()` found the first Run's row and updated its
+    turn_id to the second Run. Consequence: `/turns/{first}` returned an empty artifact list and the
+    first Run's P0-3 silently became "recorded nothing" -- a hole that appeared out of a no-op edit.
+    Both Runs wrote those bytes, so both must be able to prove it.
+    """
+    org = await make_org(app_client)
+    a = await make_agent(app_client, org["id"], "First")
+    b = await make_agent(app_client, org["id"], "Second")
+    body = "identical\n"
+
+    turn_a = await _run_writing(app_client, org["id"], a, body, path="same.md", name="First")
+    turn_b = await _run_writing(app_client, org["id"], b, body, path="same.md", name="Second")
+
+    rows_ = await rows(Artifact, Artifact.path == "same.md")
+    assert len(rows_) == 2, f"one receipt per Run, got {len(rows_)}: {[(r.turn_id, r.sha256) for r in rows_]}"
+    by_turn = {r.turn_id: r for r in rows_}
+    assert set(by_turn) == {turn_a, turn_b}, "each Run keeps its own row"
+    assert by_turn[turn_a].sha256 == by_turn[turn_b].sha256, "same bytes, by construction"
+
+    # The earlier Run must still report the artifact -- this is the assertion the bug failed.
+    r = await app_client.get(f"/api/v1/turns/{turn_a}")
+    assert r.status_code == 200
+    mine = r.json()["artifacts"]
+    assert len(mine) == 1, f"the earlier Run's receipt must survive a later identical write: {mine}"
+    assert mine[0]["path"] == "same.md"
+    assert mine[0]["turnId"] == turn_a, "and it must still name the Run that wrote it first"
+
+    # And the later Run has its own.
+    r = await app_client.get(f"/api/v1/turns/{turn_b}")
+    assert [x["turnId"] for x in r.json()["artifacts"]] == [turn_b]
+
+
+async def test_the_same_run_writing_the_same_bytes_twice_is_one_row(app_client):
+    """What the key was actually for: a Run's own retry must not fill the list with copies."""
+    from app.models import Artifact
+    org = await make_org(app_client)
+    a = await make_agent(app_client, org["id"], "Retrier")
+
+    before = len(await rows(Turn, Turn.agent_id == a["id"]))
+    script(a["id"],
+           calls(("write_file", {"path": "twice.md", "content": "same\n"})),
+           calls(("write_file", {"path": "twice.md", "content": "same\n"})),
+           say("wrote it twice"))
+    await dm(app_client, org["id"], "Retrier", "write it twice")
+
+    async def done() -> bool:
+        return len([t for t in await rows(Turn, Turn.agent_id == a["id"])
+                    if t.status in ("completed", "failed")]) > before
+
+    await wait_for(done, msg="turn", timeout=30)
+    rows_ = await rows(Artifact, Artifact.path == "twice.md")
+    assert len(rows_) == 1, f"one Run, one version, one row -- got {len(rows_)}"

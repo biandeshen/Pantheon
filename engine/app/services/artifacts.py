@@ -109,9 +109,12 @@ async def record(ctx: ToolContext, path: Path) -> Artifact:
     async with SessionLocal() as session:
         # A version, not a path: same bytes at the same path is the same row; different bytes is
         # a new one, so "the version this Run produced" stays answerable after a later rewrite.
+        # Scope the lookup to THIS Run. The same bytes written by a different Run is a second
+        # receipt, not an edit of the first -- see the comment in the else branch.
         art = (await session.execute(select(Artifact).where(
             Artifact.org_id == ctx.org.id, Artifact.path == rel,
-            Artifact.sha256 == sha256))).scalar_one_or_none() if sha256 else None
+            Artifact.sha256 == sha256,
+            Artifact.turn_id == ctx.turn_id))).scalar_one_or_none() if sha256 else None
         if art is None:
             art = Artifact(org_id=ctx.org.id, agent_id=ctx.agent.id, task_id=task_id,
                            turn_id=ctx.turn_id, path=rel, title=path.name, mime=mime,
@@ -119,9 +122,19 @@ async def record(ctx: ToolContext, path: Path) -> Artifact:
                            source_dirty=source_dirty)
             session.add(art)
         else:
-            # Rewritten by the same Run with the same bytes: refresh the attribution, keep the id.
-            art.agent_id, art.size, art.mime = ctx.agent.id, size, mime
-            art.task_id, art.turn_id = task_id or art.task_id, ctx.turn_id or art.turn_id
+            # THE SAME BYTES, A DIFFERENT RUN. The unique key is (org, path, sha256), so the row that
+            # already exists belongs to whichever Run wrote those bytes FIRST. Overwriting its
+            # turn_id moved the receipt out from under the earlier Run: measured, a later Run that
+            # rewrote a file byte-identically made /turns/{earlier} return an empty artifact list,
+            # and the earlier Run's P0-3 silently became a hole.
+            #
+            # Both Runs really did write these bytes, and both must be able to say so. So:
+            #   * the original attribution (agent, task, turn) is never overwritten
+            #   * the later Run gets its own row, which means the uniqueness has to be dropped --
+            #     done in migration 0012, where the reasoning lives
+            #   * only non-attribution fields are refreshed on the existing row
+            art.agent_id = art.agent_id or ctx.agent.id
+            art.size, art.mime = size, mime
             art.source_sha, art.source_dirty = source_sha, source_dirty
         await session.commit()
     await bus.publish("artifact.updated", artifact_to_dict(art), org_id=ctx.org.id,

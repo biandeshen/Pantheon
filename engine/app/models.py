@@ -363,7 +363,12 @@ class Artifact(Base):
     """
 
     __tablename__ = "artifacts"
-    __table_args__ = (UniqueConstraint("org_id", "path", "sha256", name="uq_artifact_version"),)
+    # Per RUN, not per org+path+bytes. Measured bug: two Runs writing byte-identical content at the
+    # same path collided on this key, and the second write overwrote the first row's turn_id -- which
+    # removed the receipt from the earlier Run and silently turned its P0-3 into a hole. Both Runs
+    # did write those bytes; both must be able to prove it. Migration 0012 drops the old key.
+    __table_args__ = (UniqueConstraint("org_id", "path", "sha256", "turn_id",
+                                       name="uq_artifact_version"),)
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: new_id("art"))
     org_id: Mapped[str] = mapped_column(ForeignKey("orgs.id", ondelete="CASCADE"), index=True)
