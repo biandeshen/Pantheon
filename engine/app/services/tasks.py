@@ -25,7 +25,7 @@ from app.core.ids import utcnow
 from app.events import bus
 from app.models import Agent, Board, Message, Org, Task, TaskEvent
 from app.services import acceptance as acceptance_check
-from app.services import comms, permissions
+from app.services import comms, followups, permissions
 from app.services.comms import USER, Sender
 
 STATUSES = ("backlog", "todo", "in_progress", "blocked", "review", "done", "cancelled")
@@ -489,7 +489,8 @@ async def update_task(
             session.add(ev)
         await session.commit()
 
-        followups: list[tuple[list[str], str, str | None]] = []
+        # (targets, text, dependent task id, reason, dependency that closed)
+        owed_notices: list[tuple[list[str], str, str | None, str, str]] = []
         if became_closed and task.status == "done":
             # Dependents whose dependencies are now all closed.
             dependents = (
@@ -503,9 +504,10 @@ async def update_task(
                     continue  # already started (or told before: a dependency closed twice)
                 others = [await session.get(Task, d) for d in dep.depends_on]
                 if all(o is None or o.status in CLOSED for o in others) and dep.assignee_id:
-                    followups.append(([dep.assignee_id],
+                    owed_notices.append(([dep.assignee_id],
                                       f"All dependencies of {task_ref(dep)} ({dep.title}) are done "
-                                      f"(last: {ref_s}). You can start it now.", dep.id))
+                                      f"(last: {ref_s}). You can start it now.", dep.id,
+                                      "dependencies-closed", task.id))
             # Parent rollup.
             if task.parent_id:
                 parent = await session.get(Task, task.parent_id)
@@ -519,18 +521,20 @@ async def update_task(
                             f"- {task_ref(s)} {s.title} [{s.status}]"
                             + (f": {s.result[:300]}" if s.result else "") for s in siblings
                         )
-                        followups.append(([owner], f"All subtasks of {task_ref(parent)} "
-                                          f"({parent.title}) are closed:\n{lines}", parent.id))
+                        owed_notices.append(([owner], f"All subtasks of {task_ref(parent)} "
+                                          f"({parent.title}) are closed:\n{lines}", parent.id,
+                                          "parent-rollup", task.id))
             # A finished goal: work still open under it is no longer needed. Tell the people
             # on it to stop (their lead can say otherwise), so a team doesn't keep polishing.
             children = (await session.execute(select(Task).where(
                 Task.parent_id == task.id, Task.status.not_in(CLOSED)))).scalars().all()
             for child in children:
                 if child.assignee_id:
-                    followups.append(([child.assignee_id],
+                    owed_notices.append(([child.assignee_id],
                                       f"{ref_s} ({task.title}) is done, so {task_ref(child)} "
                                       f"({child.title}) is no longer needed. Stop work on it, "
-                                      "and cancel it unless it still matters.", child.id))
+                                      "and cancel it unless it still matters.", child.id,
+                                      "child-stop", task.id))
 
     if comment:
         comment_msg = await comms.post(
@@ -547,9 +551,30 @@ async def update_task(
     for targets, text, wake in notices:
         await comms.notify(org_id, [t for t in targets if t and t != actor.id], text,
                            depth=actor.depth, task_id=task.id, wake=wake)
-    for targets, text, tid in followups:
-        await comms.notify(org_id, [t for t in targets if t and t != actor.id], text,
-                           depth=actor.depth, task_id=tid)
+    # Write down what we owe BEFORE sending it.
+    #
+    # The close is already committed above; the notice is a separate operation. Anything that stops
+    # the process between the two -- or any close that bypasses this function entirely -- used to
+    # leave a closed dependency and no wake-up, with nothing to re-derive it. Measured in production:
+    # T-52 closed 2026-11-20T15:27:27, and T-53 has received nothing since.
+    #
+    # The intent row is the durable record; the sweep in app.services.followups finishes what a crash
+    # interrupted, and the unique key makes "this dependency closed" produce one notice, not two.
+    owed = await followups.record_followups(org_id, [
+        {"dependency_id": dep_id, "dependent_id": dependent_id,
+         "agent_id": next((t for t in targets if t and t != actor.id), None),
+         "reason": reason, "text": text, "task_id": dependent_id}
+        for targets, text, dependent_id, reason, dep_id in owed_notices
+    ])
+    by_key = {(r.dependent_id, r.reason, r.dependency_id): r for r in owed}
+    for targets, text, dependent_id, reason, dep_id in owed_notices:
+        row = by_key.get((dependent_id, reason, dep_id))
+        msg = await comms.notify(org_id, [t for t in targets if t and t != actor.id], text,
+                                 depth=actor.depth, task_id=dependent_id)
+        # Marked sent only after the notice exists; if this line is never reached, the row stays
+        # `created` and the sweep will send it.
+        if row is not None and msg is not None:
+            await followups.mark_sent(row.id, getattr(msg, "id", None))
     _ = comment_msg
     return task
 

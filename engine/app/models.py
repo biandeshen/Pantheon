@@ -936,3 +936,31 @@ class FlowRun(Base):
     origin: Mapped[JsonDict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = _ts()
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+
+class FollowupIntent(Base):
+    """A wake-up owed to a task because one of its dependencies closed (see migration 0011).
+
+    Written before it is sent, so a process that dies in the window leaves a record that a sweep can
+    finish. The unique key makes "the same dependency closed" produce at most one notice, whether the
+    second attempt comes from a retry, a sweep, or a task closed twice.
+    """
+
+    __tablename__ = "followup_intents"
+    __table_args__ = (UniqueConstraint("dependency_id", "dependent_id", "reason",
+                                       name="uq_followup_intent"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True,
+                                    default=lambda: new_id("fup"))
+    org_id: Mapped[str] = mapped_column(ForeignKey("orgs.id", ondelete="CASCADE"), index=True)
+    dependency_id: Mapped[str] = mapped_column(String, index=True)
+    dependent_id: Mapped[str] = mapped_column(String, index=True)
+    agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    reason: Mapped[str] = mapped_column(String)  # dependencies-closed | parent-rollup | child-stop
+    text: Mapped[str] = mapped_column(Text)
+    task_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="created")  # created | sent | cancelled
+    message_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = _ts()
+    sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
