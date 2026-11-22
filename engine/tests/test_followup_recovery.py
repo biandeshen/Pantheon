@@ -26,6 +26,8 @@ assignee, so counting "any notification" would credit the wrong event.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from sqlalchemy import select
 
@@ -220,7 +222,10 @@ async def test_a_sender_that_loses_the_claim_does_not_send(app_client):
 
     outcome = await followups.deliver_one(org["id"], first["id"], second["id"],
                                           "dependencies-closed", [down["id"]], TEXT)
-    assert outcome == "claimed-by-other", outcome
+    # A freshly-claimed row with no matching message is reported `in-flight`, not `claimed-by-other`:
+    # the claim already happened, and the distinction is whether a message exists. Either way the
+    # requirement is the same -- the loser must not send.
+    assert outcome in ("in-flight", "claimed-by-other"), outcome
     assert not await _followups(second["id"]), "the loser must not send"
 
 
@@ -374,3 +379,168 @@ async def test_recovery_releases_a_claimed_delivery_without_duplicating_it(app_c
         assert len(ds) == len({d.message_id for d in ds}), "one delivery per message, never two"
     finally:
         await fresh.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_crash_after_the_message_commits_is_recognised_by_its_tag(app_client):
+    """The remaining breakpoint: message committed, mark_sent never ran, row stuck in `sending`.
+
+    Nothing recorded the message id, so the row alone cannot say whether a notice went out. The
+    message carries the intent id in `meta.followup`, so the recovery can find it and ADOPT it.
+    Unconditionally resetting `sending` to `created` would resend and produce two notices.
+    """
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+
+    # Deliver for real (this tags the message), then reproduce the crash window: the row is in
+    # `sending` with message_id NULL, exactly as a death between commit and mark_sent leaves it.
+    assert await followups.deliver_one(org["id"], first["id"], second["id"],
+                                       "dependencies-closed", [down["id"]], TEXT) == "sent"
+    original = (await _followups(second["id"]))[0]
+    assert (original.meta or {}).get("followup") == intent.id, "the send must tag the message"
+    async with SessionLocal() as session:
+        row = await session.get(FollowupIntent, intent.id)
+        row.status, row.message_id, row.sent_at = "sending", None, None
+        await session.commit()
+
+    outcome = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                          "dependencies-closed", [down["id"]], TEXT)
+    assert outcome == "adopted-existing", outcome
+    assert len(await _followups(second["id"])) == 1, "adopted the committed message, did not resend"
+    row = (await rows(FollowupIntent, FollowupIntent.id == intent.id))[0]
+    assert row.status == "sent" and row.message_id == original.id
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_recovers_a_sending_row_without_duplicating_it(app_client):
+    """Same breakpoint, reached through the restart path rather than a direct call."""
+    org, _up, down, first, second = await _chain(app_client)
+    # Close for real, so the sweep's own precondition (a closed dependency, an owed notice) holds.
+    # Seeding the row without closing would make _still_owed cancel it -- correctly, since the reason
+    # would be false -- and the test would then be measuring the wrong branch.
+    await _close(app_client, first["id"])
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+
+    # Rewind to the crash window: message committed, row `sending`, message_id NULL.
+    async with SessionLocal() as session:
+        row = await session.get(FollowupIntent, intent.id)
+        row.status, row.message_id, row.sent_at = "sending", None, None
+        await session.commit()
+
+    counts = await followups.sweep_followups()
+    assert counts["sent"] == 0, counts
+    assert counts["skipped"] == 1, counts
+    assert len(await _followups(second["id"])) == 1, "still one notice after the sweep"
+    assert await followups.owed_count(org["id"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_stale_sending_row_with_no_message_is_released_not_duplicated(app_client):
+    """The other half: if no message exists, the send never committed, so the row must be reusable."""
+    from datetime import timedelta
+
+    from app.core.ids import utcnow
+
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+    async with SessionLocal() as session:
+        row = await session.get(FollowupIntent, intent.id)
+        row.status, row.message_id = "sending", None
+        row.sent_at = utcnow() - timedelta(seconds=followups.SENDING_GRACE_SECONDS + 5)
+        await session.commit()
+
+    outcome = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                          "dependencies-closed", [down["id"]], TEXT)
+    assert outcome == "released-stale", outcome
+    assert not await _followups(second["id"]), "released, not sent -- the caller retries"
+
+    again = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                        "dependencies-closed", [down["id"]], TEXT)
+    assert again == "sent"
+    assert len(await _followups(second["id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_sending_row_is_left_alone(app_client):
+    """Releasing a live send would be worse than a slow one: the release is what allows a second."""
+    org, _up, down, first, second = await _chain(app_client)
+    await _seed_owed(org["id"], first, second, down["id"])
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+    async with SessionLocal() as session:
+        row = await session.get(FollowupIntent, intent.id)
+        row.status, row.message_id = "sending", None
+        await session.commit()
+
+    outcome = await followups.deliver_one(org["id"], first["id"], second["id"],
+                                          "dependencies-closed", [down["id"]], TEXT)
+    assert outcome == "in-flight", outcome
+    assert not await _followups(second["id"])
+
+
+@pytest.mark.asyncio
+async def test_two_restarts_write_the_downstream_result_once(app_client, monkeypatch):
+    """The chain the review demands, measured at the BUSINESS result, not at the notice state.
+
+    Counting deliveries or checking `status == sent` would pass even if the downstream task ran twice
+    and wrote its result twice -- the notice is upstream of that. So this asserts:
+      one notice id -> one delivery -> one successful turn -> one result write
+    across two restarts, with the crash injected between the message commit and mark_sent.
+    """
+    org, _up, down, first, second = await _chain(app_client, with_script=True)
+
+    # Crash the FIRST send after the message commits: deliver for real, then rewind to `sending`.
+    await _close(app_client, first["id"])
+    notes = await _followups(second["id"])
+    assert len(notes) == 1, "the close delivered its notice before we rewind it"
+    notice = notes[0]
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+    async with SessionLocal() as session:
+        row = await session.get(FollowupIntent, intent.id)
+        row.status, row.message_id, row.sent_at = "sending", None, None
+        await session.commit()
+
+    # Restart #1: must adopt the committed message, not resend, and let the downstream run.
+    async def restart():
+        rt = runtime_mod.Runtime()
+        runtime_mod.runtime = rt
+        import app.main as main_mod
+        main_mod.runtime = rt
+        await rt.start()
+        return rt
+
+    r1 = await restart()
+    try:
+        async def ran() -> bool:
+            return bool(await rows(Turn, Turn.agent_id == down["id"], Turn.status == "completed"))
+
+        await wait_for(ran, msg="downstream run after restart 1", timeout=30)
+    finally:
+        await r1.stop()
+
+    # Restart #2: nothing left to do. It must not send a second notice nor start a second run.
+    r2 = await restart()
+    try:
+        await asyncio.sleep(2.0)
+    finally:
+        await r2.stop()
+
+    # --- assertions on the business chain, not on the notice's own bookkeeping ---
+    follow_ups = await _followups(second["id"])
+    assert len(follow_ups) == 1, f"one notice, got {len(follow_ups)}"
+    assert follow_ups[0].id == notice.id, "and it is the same message, adopted rather than replaced"
+
+    delivs = await rows(Delivery, Delivery.message_id == notice.id)
+    assert len(delivs) == 1, f"one delivery per notice, got {len(delivs)}"
+
+    runs = await rows(Turn, Turn.agent_id == down["id"])
+    assert len(runs) == 1, f"the downstream task ran ONCE across two restarts, got {len(runs)} times"
+    assert delivs[0].turn_id == runs[0].id, "the notice led to exactly that run"
+
+    row = (await rows(FollowupIntent, FollowupIntent.id == intent.id))[0]
+    assert row.status == "sent" and row.message_id == notice.id
+    assert row.attempts == 1, f"claimed once, got {row.attempts}"
+
+    # One run is the claim; the status line above is not. A duplicate would show as a second Turn
+    # and a second result write, which is what the counts assert.

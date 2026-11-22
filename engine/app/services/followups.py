@@ -120,13 +120,61 @@ async def cancel(intent_id: str) -> None:
 
 
 async def _existing_message(row: FollowupIntent):
-    """Did this intent's notice already get created? Then never create a second one."""
-    if not row.message_id:
-        return None
+    """Did this intent's notice already get created? Then never create a second one.
+
+    Two ways to know, and the second is the one that matters after a crash:
+
+      row.message_id set   the normal path -- it was marked after sending
+      row in `sending`, message_id NULL, but a message carrying this intent's id in `meta.followup`
+                            the process died AFTER the message was committed and BEFORE mark_sent.
+                            Nothing recorded the message id, so looking only at the column finds
+                            nothing and a naive retry sends a second notice.
+
+    The meta tag is written by deliver_one on every send, so the message itself is the record. This is
+    why "unconditionally reset `sending` to `created` and resend" is wrong: `sending` with a matching
+    message means "sent, not yet marked", and the honest recovery is to adopt it.
+    """
     from app.models import Message
 
     async with SessionLocal() as session:
-        return await session.get(Message, row.message_id)
+        if row.message_id:
+            got = await session.get(Message, row.message_id)
+            if got is not None:
+                return got
+        return await _find_tagged(session, row)
+
+
+# How long a `sending` row is trusted before it is assumed dead. Generous on purpose: releasing a
+# live send would be worse than a slow one, because the release is what allows a second message.
+SENDING_GRACE_SECONDS = 120
+
+
+def _is_stale(row: FollowupIntent) -> bool:
+    """Is a `sending` row old enough that no live worker can still own it?"""
+    from datetime import timedelta
+
+    when = row.sent_at or row.created_at
+    if when is None:
+        return True
+    return utcnow() - when > timedelta(seconds=SENDING_GRACE_SECONDS)
+
+
+async def _find_tagged(session, row: FollowupIntent):
+    """A message that carries this intent's id, whatever the row's status says.
+
+    Scans the dependent task's notifications and checks meta.followup. Bounded by the task's own
+    notifications, which is a handful even on a busy task.
+    """
+    from app.models import Message
+
+    rows_ = (await session.execute(
+        select(Message).where(Message.kind == "notification",
+                              Message.task_id == row.dependent_id)
+    )).scalars().all()
+    for m in rows_:
+        if (m.meta or {}).get("followup") == row.id:
+            return m
+    return None
 
 
 async def deliver_one(org_id: str, dependency_id: str, dependent_id: str, reason: str,
@@ -153,6 +201,24 @@ async def deliver_one(org_id: str, dependency_id: str, dependent_id: str, reason
         if row.status == "cancelled":
             return "cancelled"
 
+    # A row stuck in `sending` is the crash-after-commit case, and it must be handled BEFORE the
+    # claim -- `claim` only accepts `created`, so asking it first would report "someone else has it"
+    # forever and the notice would never be delivered or adopted.
+    #
+    # Three outcomes, and they are not interchangeable:
+    #   tagged message exists   -> sent but unmarked: adopt it, do NOT resend
+    #   no message, still fresh -> another worker may be mid-send right now: leave it alone
+    #   no message, stale       -> the send never committed: release it so a later attempt can run
+    if row.status == "sending":
+        tagged = await _existing_message(row)
+        if tagged is not None:
+            await mark_sent(intent_id, tagged.id)
+            return "adopted-existing"
+        if not _is_stale(row):
+            return "in-flight"
+        await release(intent_id)
+        return "released-stale"
+
     if not await claim(intent_id):
         return "claimed-by-other"
 
@@ -168,7 +234,11 @@ async def deliver_one(org_id: str, dependency_id: str, dependent_id: str, reason
         # task_id is not decoration: it is how the notice is found later (and how a reader can tell
         # a dependency wake-up from the notice a task gets when it is created). Dropping it here was
         # a real bug -- the row said `sent`, and the message existed with no task to look it up by.
-        msg = await send(org_id, targets, text, depth=depth, task_id=dependent_id)
+        # The tag is the durable link between a message and the intent that caused it. Without it a
+        # crash after this line and before mark_sent leaves a delivered notice nobody can identify,
+        # and the recovery has to choose between losing it and sending it twice.
+        msg = await send(org_id, targets, text, depth=depth, task_id=dependent_id,
+                         meta={"followup": intent_id})
     except Exception:  # noqa: BLE001 - the caller must keep going; the row stays owed
         log.exception("follow-up %s could not be sent; releasing it", intent_id)
         await release(intent_id)
@@ -202,8 +272,10 @@ async def sweep_followups(notify=None) -> dict[str, int]:
     """Send what is owed, cancel what no longer applies. Counts go to the log and the tests."""
     sent = cancelled = failed = skipped = 0
     async with SessionLocal() as session:
+        # `sending` too: a row left in that state by a crash is exactly what the sweep exists for.
+        # deliver_one decides whether it is adoptable, in flight, or stale -- the sweep does not guess.
         rows = (await session.execute(
-            select(FollowupIntent).where(FollowupIntent.status == "created")
+            select(FollowupIntent).where(FollowupIntent.status.in_(("created", "sending")))
         )).scalars().all()
         pending = [(r.id, r.org_id, r.dependent_id, r.dependency_id, r.reason, r.text,
                     r.task_id, r.agent_id) for r in rows]
@@ -213,7 +285,7 @@ async def sweep_followups(notify=None) -> dict[str, int]:
             dependent = await session.get(Task, dependent_id)
             dependency = await session.get(Task, dependency_id) if dependency_id else None
             row = await session.get(FollowupIntent, intent_id)
-            if row is None or row.status != "created":
+            if row is None or row.status not in ("created", "sending"):
                 continue
             owed, why = _still_owed(row, dependent, dependency)
             if not owed:
@@ -231,7 +303,10 @@ async def sweep_followups(notify=None) -> dict[str, int]:
                                     notify=notify)
         if outcome == "sent":
             sent += 1
-        elif outcome in ("claimed-by-other", "already-sent", "adopted-existing"):
+        elif outcome in ("claimed-by-other", "already-sent", "adopted-existing", "in-flight",
+                         "released-stale"):
+            # released-stale counts as skipped, not sent: nothing went out this round; the row is
+            # simply available again, and the next pass will try.
             skipped += 1
         elif outcome == "send-failed":
             failed += 1

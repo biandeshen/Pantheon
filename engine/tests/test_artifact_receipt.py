@@ -45,14 +45,19 @@ async def _run_writing(client, org_id: str, agent: dict, body: str, *, path="out
     after the first call, and waiting on that would hand back the previous turn's id -- which is
     how a receipt test silently checks the wrong Run.
     """
-    before = len(await rows(Turn, Turn.agent_id == agent["id"]))
+    # Count FINISHED turns before, and compare like with like. Counting all turns and then comparing
+    # against only the finished ones made the condition unreachable whenever an earlier turn was
+    # still running: `before` included it, so len(completed) could never exceed it. That is a 30s
+    # timeout, which reads as a slow test rather than a broken predicate.
+    def finished(ts):
+        return [t for t in ts if t.status in ("completed", "failed")]
+
+    before = len(finished(await rows(Turn, Turn.agent_id == agent["id"])))
     script(agent["id"], calls(("write_file", {"path": path, "content": body})), say("wrote it"))
     await dm(client, org_id, name, "please write it")
 
     async def done() -> bool:
-        done_ = [t for t in await rows(Turn, Turn.agent_id == agent["id"])
-                 if t.status in ("completed", "failed")]
-        return len(done_) > before
+        return len(finished(await rows(Turn, Turn.agent_id == agent["id"]))) > before
 
     await wait_for(done, msg="turn", timeout=30)
     return (await rows(Turn, Turn.agent_id == agent["id"]))[-1].id
@@ -207,7 +212,8 @@ async def test_the_source_commit_is_captured_inside_a_git_checkout(app_client, t
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True,
                           text=True, check=True).stdout.strip()
 
-    before = len(await rows(Turn, Turn.agent_id == agent["id"]))
+    before = len([t for t in await rows(Turn, Turn.agent_id == agent["id"])
+                  if t.status in ("completed", "failed")])
     script(agent["id"], calls(("write_file", {"path": "checkout/notes.md", "content": "n\n"})),
            say("ok"))
     await dm(app_client, org["id"], "Ann", "write in the checkout")
@@ -277,7 +283,8 @@ async def test_the_same_run_writing_the_same_bytes_twice_is_one_row(app_client):
     org = await make_org(app_client)
     a = await make_agent(app_client, org["id"], "Retrier")
 
-    before = len(await rows(Turn, Turn.agent_id == a["id"]))
+    before = len([t for t in await rows(Turn, Turn.agent_id == a["id"])
+                  if t.status in ("completed", "failed")])
     script(a["id"],
            calls(("write_file", {"path": "twice.md", "content": "same\n"})),
            calls(("write_file", {"path": "twice.md", "content": "same\n"})),
