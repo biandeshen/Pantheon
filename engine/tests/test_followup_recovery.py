@@ -678,3 +678,109 @@ async def test_claim_refuses_a_sent_row(app_client):
     assert await followups.claim(intent.id) is False
     assert await followups.claim(intent.id, allow_cancelled=True) is False, \
         "reissue permission covers cancelled, never sent"
+
+
+@pytest.mark.asyncio
+async def test_the_woken_task_produces_and_writes_back_exactly_once(app_client):
+    """The second real order must PRODUCE something and WRITE IT BACK, once, across restarts.
+
+    The existing two-restart test stops at "one run happened". That is upstream of the thing the
+    chairman asked for: the downstream order has to leave a real product and record its own result.
+    So this drives the real path end to end and counts artifacts and result writes:
+
+      one notice -> one delivery -> one completed turn -> one artifact -> one result write
+
+    A duplicate run would show as a second artifact or a second result write, which is what the
+    counts assert -- not the delivery's status field.
+    """
+    org = await make_org(app_client)
+    up = await make_agent(app_client, org["id"], "Up")
+    down = await make_agent(app_client, org["id"], "Down")
+    first = await _mk_task(app_client, org["id"], title="upstream", assignee=up["id"])
+    second = await _mk_task(app_client, org["id"], title="downstream", assignee=down["id"],
+                            depends_on=[first["id"]])
+
+    # The woken agent does real work: writes a file, then records its own result.
+    from tests.helpers import calls
+
+    script(down["id"],
+           calls(("write_file", {"path": "second-order.md", "content": "produced by the second order\n"})),
+           calls(("update_task", {"task": second["ref"], "result": "second order delivered"})),
+           say("done"))
+
+    await _close(app_client, first["id"])
+
+    # Put the row into the crash window on purpose: the message is committed, the row says `sending`
+    # with no message id.
+    #
+    # LIMIT, stated rather than glossed: this exercises recovery of the ROW, not of the delivery. The
+    # message was already delivered before the rewind, so the downstream run would have happened
+    # either way -- mutating the adoption branch does not make this test fail, and pretending it does
+    # would be the same overclaim as before. Adoption itself is pinned by
+    # test_a_crash_after_the_message_commits_is_recognised_by_its_tag and
+    # test_a_sweep_recovers_a_sending_row_without_duplicating_it, which do fail when it is removed.
+    intent = (await rows(FollowupIntent, FollowupIntent.dependent_id == second["id"]))[0]
+    async with SessionLocal() as session:
+        row = await session.get(FollowupIntent, intent.id)
+        row.status, row.message_id, row.sent_at = "sending", None, None
+        await session.commit()
+
+    async def delivered() -> bool:
+        t = (await rows(Task, Task.id == second["id"]))[0]
+        return bool(t.result and "second order delivered" in t.result)
+
+    await wait_for(delivered, msg="downstream result written", timeout=40)
+
+    # Restart twice: neither may produce a second artifact or a second result write.
+    for _ in range(2):
+        rt = runtime_mod.Runtime()
+        runtime_mod.runtime = rt
+        import app.main as main_mod
+        main_mod.runtime = rt
+        await rt.start()
+        try:
+            await asyncio.sleep(1.5)
+        finally:
+            await rt.stop()
+
+    from app.models import Artifact
+
+    runs = await rows(Turn, Turn.agent_id == down["id"])
+    assert len(runs) == 1, f"the second order ran once, got {len(runs)}"
+
+    arts = await rows(Artifact, Artifact.path == "second-order.md")
+    assert len(arts) == 1, f"one product, got {len(arts)}"
+    assert arts[0].turn_id == runs[0].id, "and it belongs to the run that was woken"
+
+    task = (await rows(Task, Task.id == second["id"]))[0]
+    assert task.result and task.result.count("second order delivered") == 1, (
+        f"the result was written once: {task.result!r}")
+
+    notes = await _followups(second["id"])
+    assert len(notes) == 1, "and still one notice, not one per restart"
+
+
+@pytest.mark.asyncio
+async def test_a_woken_task_that_produces_nothing_is_not_counted_as_delivered(app_client):
+    """The negative case: a run happening is not a delivery. Without a product and a result, it is a hole.
+
+    This is the other half of "produce and write back" -- otherwise a task that woke up, did nothing
+    and closed would read as success.
+    """
+    org, _up, down, first, second = await _chain(app_client, with_script=True)
+    await _close(app_client, first["id"])
+
+    async def ran() -> bool:
+        return bool(await rows(Turn, Turn.agent_id == down["id"], Turn.status == "completed"))
+
+    await wait_for(ran, msg="downstream run", timeout=30)
+
+    from app.models import Artifact
+
+    runs = await rows(Turn, Turn.agent_id == down["id"])
+    assert len(runs) == 1
+    assert not await rows(Artifact, Artifact.turn_id == runs[0].id), "this script wrote nothing"
+    task = (await rows(Task, Task.id == second["id"]))[0]
+    assert not task.result, "and recorded no result"
+    # The point: one completed run exists, and it is still not a delivered order.
+    assert not (runs and task.result), "a run is not a delivery"
