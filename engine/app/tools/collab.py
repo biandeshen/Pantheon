@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import select
 
 from app.core.db import SessionLocal
-from app.models import Agent, Channel, FeatureRequest, Relationship
+from app.models import Agent, Channel, FeatureRequest, Org, Relationship, Task, TaskEvent
 from app.services import comms, memory, tasks
 from app.services.comms import USER, CommsError
-from app.services.tasks import STATUSES, TaskError, task_ref
+from app.services import permissions
+from app.services.tasks import CLOSED, STATUSES, TaskError, task_ref
 from app.tools.base import B, I, S, ToolContext, ToolError, arr, obj, tool
+
+log = logging.getLogger(__name__)
 
 
 async def _names(org_id: str) -> dict[str, str]:
@@ -305,6 +310,175 @@ async def _known_tasks(org_id: str, refs: list[str]) -> tuple[list[str], list[st
         for ref in refs:
             (known if await tasks.find_task(session, org_id, str(ref)) else missing).append(str(ref))
     return known, missing
+
+
+@tool(
+    "claim_task",
+    """Take a task for yourself, atomically. Use this instead of update_task when you are
+picking up work that nobody has been assigned yet: if another agent is claiming the same
+task at the same moment, exactly one of you gets it and the other is told it is taken.
+
+With no argument it takes the oldest free task. Pass task="T-12" to claim a specific one,
+or label="research" to restrict to one area. Claiming a task you already hold does nothing.
+If nothing is free it says so -- it never invents work.""",
+    obj({
+        "task": {"type": "string", "description": "Task ref to claim, e.g. T-12. Omit for the next free one."},
+        "label": S,
+    }, []),
+    category="tasks",
+)
+async def claim_task(args: dict, ctx: ToolContext) -> str:
+    # The claimant is ctx.sender, never a value from the request: an agent can only claim
+    # for itself. There is deliberately no `agent` argument here and no `force` either --
+    # letting a caller name someone else, or take a held task, is exactly the impersonation
+    # and strong-arming this tool exists to prevent. A supervisor reassigning work uses
+    # update_task, which is a person-originated action with its own permission check.
+    try:
+        if args.get("task"):
+            t = await tasks.claim_task(ctx.org.id, ctx.sender, str(args["task"]))
+        else:
+            t = await tasks.claim_next(ctx.org.id, ctx.sender, label=args.get("label"))
+    except tasks.ClaimConflict as e:
+        raise ToolError(str(e)) from None
+    except TaskError as e:
+        raise ToolError(str(e)) from None
+    if t is None:
+        return ("Nothing free to claim right now: no open unassigned task without unmet "
+                "dependencies. Ask someone what to pick up instead of inventing work.")
+    ref = task_ref(t)
+    waiting = [task_ref(d) for d in await _open_deps(ctx, t)]
+    extra = f" It still waits on {', '.join(waiting)}." if waiting else ""
+    return f"Claimed {ref} ({t.title}) [{t.status}].{extra}"
+
+
+@tool(
+    "reassign_stalled_task",
+    """Take a task away from an agent that can no longer work, and give it to someone who can.
+Supervisor only.
+
+This exists for one situation: a task sits in progress under an agent that is disabled,
+paused, standby, or in error, so it will never move again on its own. You can see that from
+org_activity. Nothing else in the system closes that gap -- claim_task refuses a held task
+(correctly: two agents on one task is worse than one stuck task), and an ordinary agent
+cannot take someone else's work. So the holder has to be told, by someone with the standing
+to do it.
+
+It will NOT steal from a healthy holder. If the assignee is active and working, this refuses
+and tells you to message them instead. Reassigning a live agent's work is a management
+decision made by talking to them, not by a tool that quietly moves their task.
+
+The partial result stays exactly where it is: this changes the assignee and nothing else.""",
+    obj({
+        "task": {"type": "string", "description": "Task ref, e.g. T-52."},
+        "to": {"type": "string", "description": "Agent who should take over, e.g. Kit."},
+        "reason": {"type": "string", "description": "Why the current holder cannot continue."},
+    }, ["task", "to", "reason"]),
+    category="tasks",
+)
+async def reassign_stalled_task(args: dict, ctx: ToolContext) -> str:
+    # Supervisor-only, and deliberately narrow. Two separate safeguards, because each one
+    # alone would leave a hole:
+    #   - the caller must be a supervisor, or any agent could take any task by calling this;
+    #   - the current holder must be unable to work, or this becomes a stealth way to steal
+    #     live work -- which is the thing claim_task's 409 exists to prevent.
+    if not getattr(ctx.agent, "is_supervisor", False):
+        raise ToolError("only a supervisor can reassign someone else's task; "
+                        "use claim_task for unassigned work")
+    from app.core.db import SessionLocal
+    from app.models import Agent, Task, TaskEvent, Task
+
+    # Check and write in ONE transaction, with the row locked. Two reasons, both learned the
+    # hard way in this batch:
+    #   - the check-then-write used to run in separate sessions, so a holder could come back
+    #     to life between them and lose work it had resumed;
+    #   - without the lock, two supervisors could both see "stalled" and both reassign.
+    org_id, ref, to_ref, reason = ctx.org.id, str(args["task"]), str(args["to"]), str(args["reason"])
+    async with SessionLocal() as session:
+        t = await tasks.find_task(session, org_id, ref)
+        if t is None:
+            raise ToolError(f"no task {ref} in this organisation")
+        t = (await session.execute(
+            select(Task).where(Task.id == t.id).with_for_update())).scalar_one()
+        ref = task_ref(t)
+
+        # A closed task is finished business. Moving it back to in_progress would reopen
+        # something a reviewer closed, which is not a handover -- reopening is its own
+        # decision made by its own path.
+        if t.status in CLOSED:
+            raise ToolError(f"{ref} is {t.status}; finished work is not reassigned. "
+                            f"Reopening it is a separate decision.")
+        # A task sitting in review is waiting on a reviewer, not on the holder. Taking it
+        # from the holder would discard a hand-in that someone is about to read.
+        if t.status == "review":
+            raise ToolError(f"{ref} is in review waiting for its reviewer; reassigning it "
+                            f"would throw away the submitted work.")
+
+        holder = await session.get(Agent, t.assignee_id) if t.assignee_id else None
+        if holder is None:
+            raise ToolError(f"{ref} has no assignee; use claim_task or update_task")
+        if holder.id == ctx.agent.id:
+            raise ToolError(f"you already hold {ref}")
+        # "Waiting for approval" is not being stuck. The agent is blocked on a person, and
+        # will continue the moment that person answers -- taking the task would strand work
+        # it is actively in the middle of. Only a holder that cannot run at all counts.
+        if holder.runtime_status == "awaiting_approval":
+            raise ToolError(
+                f"{holder.name} is not stalled: it is waiting for an approval on {ref}. "
+                f"Approve or deny that request instead of reassigning its work.")
+        if holder.status == "active":
+            raise ToolError(
+                f"{holder.name} is active ({holder.runtime_status}); this tool is for stalled "
+                f"holders only. Message {holder.name} about {ref} instead of taking it.")
+        stalled_because = f"status={holder.status}, runtime={holder.runtime_status}"
+        holder_name = holder.name
+
+        taker = await comms.resolve_agent(session, org_id, to_ref)
+        if taker is None:
+            raise ToolError(f"no colleague named '{to_ref}'")
+
+        # Reload the org inside this session and run BOTH checks, because they answer
+        # different questions and passing one does not imply the other:
+        #   check_assign -- may this agent hand work to that agent?
+        #   check_edit   -- may this agent change THIS task at all?
+        # An earlier version kept only check_assign, so a supervisor whose edit scope did not
+        # cover the task could still move it. Being allowed to hire someone is not the same as
+        # being allowed to take their work.
+        org = await session.get(Org, org_id)
+        if org is None:
+            raise ToolError("this organisation no longer exists")
+        try:
+            await permissions.check_edit(session, org, ctx.agent.id, "agent", t)
+            await permissions.check_assign(session, org, ctx.agent.id, "agent", taker.id)
+        except permissions.PermissionDenied as e:
+            raise ToolError(str(e)) from None
+
+        t.assignee_id = taker.id
+        t.status = "in_progress"
+        session.add(TaskEvent(task_id=t.id, actor_id=ctx.agent.id, kind="assignee",
+                              data={"from": holder.id, "to": taker.id,
+                                    "why": f"reassigned from stalled holder ({stalled_because})",
+                                    "reason": reason}))
+        await session.commit()
+
+    note = (f"Reassigned {ref} from {holder_name} ({stalled_because}) to {to_ref}. "
+            f"Reason given: {reason}. The previous holder's result and comments are "
+            f"kept; the new holder continues from them.")
+    # The comment is a separate write: it must not be able to fail the reassignment that
+    # already happened, or the task would be moved with no record of why.
+    try:
+        await tasks.update_task(org_id, ctx.sender, ref, comment=note)
+    except Exception:  # pragma: no cover - the move itself is already committed
+        log.warning("reassign note failed for %s", ref)
+    return note
+
+
+async def _open_deps(ctx: ToolContext, t: object) -> list[object]:
+    from app.core.db import SessionLocal
+    from app.models import Task
+
+    async with SessionLocal() as session:
+        fresh = await session.get(Task, t.id)  # type: ignore[attr-defined]
+        return await tasks.open_dependencies(session, fresh) if fresh is not None else []
 
 
 @tool(

@@ -354,16 +354,37 @@ class TaskEvent(Base):
 
 
 class Artifact(Base):
+    """A file an agent wrote, with the run that wrote it and the exact bytes it wrote.
+
+    ``task_id``/``turn_id`` are recorded, never inferred later: a receipt has to say which Run
+    produced this version, and "the run that was closest in time" is not that. Both stay NULL
+    for rows written before this column existed -- back-filling them from timestamps would
+    recreate exactly the inference this table exists to avoid.
+    """
+
     __tablename__ = "artifacts"
+    # Per RUN, not per org+path+bytes. Measured bug: two Runs writing byte-identical content at the
+    # same path collided on this key, and the second write overwrote the first row's turn_id -- which
+    # removed the receipt from the earlier Run and silently turned its P0-3 into a hole. Both Runs
+    # did write those bytes; both must be able to prove it. Migration 0012 drops the old key.
+    __table_args__ = (UniqueConstraint("org_id", "path", "sha256", "turn_id",
+                                       name="uq_artifact_version"),)
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: new_id("art"))
     org_id: Mapped[str] = mapped_column(ForeignKey("orgs.id", ondelete="CASCADE"), index=True)
     agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    task_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    turn_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     path: Mapped[str] = mapped_column(String)
     title: Mapped[str] = mapped_column(String, default="")
     mime: Mapped[str] = mapped_column(String, default="text/plain")
     size: Mapped[int] = mapped_column(Integer, default=0)
+    # The engine hashes the bytes it just wrote; a hash the model reports is not a receipt.
+    sha256: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Where this version sat in a git checkout at write time: the commit, and whether the file
+    # still differed from it. NULL means "not in a git repo", never "clean".
+    source_sha: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_dirty: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = _ts()
 
 
@@ -920,3 +941,31 @@ class FlowRun(Base):
     origin: Mapped[JsonDict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = _ts()
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+
+class FollowupIntent(Base):
+    """A wake-up owed to a task because one of its dependencies closed (see migration 0011).
+
+    Written before it is sent, so a process that dies in the window leaves a record that a sweep can
+    finish. The unique key makes "the same dependency closed" produce at most one notice, whether the
+    second attempt comes from a retry, a sweep, or a task closed twice.
+    """
+
+    __tablename__ = "followup_intents"
+    __table_args__ = (UniqueConstraint("dependency_id", "dependent_id", "reason",
+                                       name="uq_followup_intent"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True,
+                                    default=lambda: new_id("fup"))
+    org_id: Mapped[str] = mapped_column(ForeignKey("orgs.id", ondelete="CASCADE"), index=True)
+    dependency_id: Mapped[str] = mapped_column(String, index=True)
+    dependent_id: Mapped[str] = mapped_column(String, index=True)
+    agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    reason: Mapped[str] = mapped_column(String)  # dependencies-closed | parent-rollup | child-stop
+    text: Mapped[str] = mapped_column(Text)
+    task_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="created")  # created | sent | cancelled
+    message_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = _ts()
+    sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)

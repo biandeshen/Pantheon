@@ -25,7 +25,7 @@ from app.core.ids import utcnow
 from app.events import bus
 from app.models import Agent, Board, Message, Org, Task, TaskEvent
 from app.services import acceptance as acceptance_check
-from app.services import comms, permissions
+from app.services import comms, followups, permissions
 from app.services.comms import USER, Sender
 
 STATUSES = ("backlog", "todo", "in_progress", "blocked", "review", "done", "cancelled")
@@ -222,6 +222,114 @@ async def open_dependencies(session: AsyncSession, task: Task) -> list[Task]:
     return [d for d in deps if d is not None and d.status not in CLOSED]
 
 
+class ClaimConflict(TaskError):
+    """Raised when a task cannot be claimed because someone else already holds it.
+
+    Separate from TaskError so the HTTP layer can answer 409 instead of 400: "you lost a
+    race" and "you asked for something invalid" are different facts and callers need to
+    tell them apart.
+    """
+
+
+async def claim_task(org_id: str, actor: Sender, ref: str, *, force: bool = False) -> Task:
+    """Atomically take a task for the acting agent.
+
+    Why this exists as its own operation rather than "PATCH status=in_progress and
+    assignee=me": two agents doing that concurrently both succeed, and the second write
+    silently overwrites the first. The loser believes it owns the task and starts work on
+    something another agent is already doing. There was no way to express "claim only if
+    still free" through PATCH, so an agent could not self-assign without a human checking
+    first -- which is exactly what autonomous claiming must not require.
+
+    The guard is the row lock, not a hopeful read: `with_for_update()` is taken inside the
+    transaction, so two concurrent claims serialise on the row and the second one observes
+    the first one's assignee. An already-held task is refused unless `force=True` (used by
+    a supervisor reassigning work, never by the claiming agent itself).
+    """
+    if actor.type != "agent":
+        raise ClaimConflict("only an agent can claim a task; a person assigns instead")
+
+    async with SessionLocal() as session:
+        task = await find_task(session, org_id, ref)
+        if task is None:
+            raise ClaimConflict(f"task '{ref}' not found")
+        # Lock the row first; everything below reads the locked version, so no other
+        # transaction can slip an assignee in between the check and the write.
+        task = (
+            await session.execute(select(Task).where(Task.id == task.id).with_for_update())
+        ).scalar_one()
+        org = await session.get(Org, org_id)
+        assert org is not None
+
+        if task.status in CLOSED:
+            raise ClaimConflict(f"task '{ref}' is {task.status} and cannot be claimed")
+        # A task can be given an owner when it is created. Returning early here looked like
+        # the idempotent branch, but it made those tasks impossible to start: the response
+        # said "Claimed ... [todo]" and the row never left todo. Only a task already in
+        # progress is genuinely a no-op; one that is still open must transition.
+        if task.assignee_id == actor.id and task.status not in ("backlog", "todo"):
+            return task  # idempotent: claiming what you are already working on
+        if task.assignee_id and task.assignee_id != actor.id and not force:
+            raise ClaimConflict(
+                f"task '{ref}' is already held by another agent; pick a different task "
+                "instead of taking someone else's work")
+        waiting = [task_ref(d) for d in await open_dependencies(session, task)]
+        if waiting:
+            raise ClaimConflict(
+                f"task '{ref}' still waits on {', '.join(waiting)}; it cannot be claimed yet")
+
+        await permissions.check_edit(session, org, actor.id, actor.type, task)
+
+        previous_assignee = task.assignee_id
+        previous_status = task.status
+        task.assignee_id = actor.id
+        if task.status in ("backlog", "todo"):
+            task.status = "in_progress"
+            # A claim that starts work must be visible as a status change too. Without it the
+            # timeline says "claimed" while nothing shows the task left todo, which is exactly
+            # how a stuck mission looked normal from the outside.
+            session.add(TaskEvent(task_id=task.id, actor_id=actor.id, kind="status",
+                                  data={"from": previous_status, "to": "in_progress",
+                                        "via": "claim"}))
+        session.add(TaskEvent(task_id=task.id, actor_id=actor.id, kind="claimed",
+                              data={"from": previous_assignee, "to": actor.id,
+                                    "status": task.status, "forced": bool(force)}))
+        await session.commit()
+
+    await bus.publish("task.claimed", task_to_dict(task), org_id=org_id, agent_id=actor.id)
+    return task
+
+
+async def claim_next(org_id: str, actor: Sender, *, label: str | None = None) -> Task | None:
+    """Claim the first task that is actually free, or return None.
+
+    This is the entry point autonomous work needs: "give me something to do" without a
+    human naming it. Selection order is deliberately boring -- oldest first, open status,
+    unassigned, no unmet dependencies -- because a clever heuristic here would be a policy
+    nobody asked for and impossible to audit. `label` narrows to one business area so two
+    agents do not fight over the same queue.
+    """
+    if actor.type != "agent":
+        raise ClaimConflict("only an agent can claim a task")
+
+    async with SessionLocal() as session:
+        stmt = (select(Task).where(Task.org_id == org_id, Task.assignee_id.is_(None),
+                                  Task.status.in_(("backlog", "todo")))
+                .order_by(Task.created_at.asc()))
+        candidates = (await session.execute(stmt)).scalars().all()
+
+    for task in candidates:
+        if label and label not in (task.labels or []):
+            continue
+        try:
+            return await claim_task(org_id, actor, task_ref(task))
+        except ClaimConflict:
+            # Someone took it between listing and claiming. That is the race this design
+            # exists to survive; move on rather than failing the whole call.
+            continue
+    return None
+
+
 async def update_task(
     org_id: str,
     actor: Sender,
@@ -379,9 +487,9 @@ async def update_task(
                                     data={"text": comment[:4000]}))
         for ev in events:
             session.add(ev)
-        await session.commit()
 
-        followups: list[tuple[list[str], str, str | None]] = []
+        # (targets, text, dependent task id, reason, dependency that closed)
+        owed_notices: list[tuple[list[str], str, str | None, str, str]] = []
         if became_closed and task.status == "done":
             # Dependents whose dependencies are now all closed.
             dependents = (
@@ -395,9 +503,10 @@ async def update_task(
                     continue  # already started (or told before: a dependency closed twice)
                 others = [await session.get(Task, d) for d in dep.depends_on]
                 if all(o is None or o.status in CLOSED for o in others) and dep.assignee_id:
-                    followups.append(([dep.assignee_id],
+                    owed_notices.append(([dep.assignee_id],
                                       f"All dependencies of {task_ref(dep)} ({dep.title}) are done "
-                                      f"(last: {ref_s}). You can start it now.", dep.id))
+                                      f"(last: {ref_s}). You can start it now.", dep.id,
+                                      "dependencies-closed", task.id))
             # Parent rollup.
             if task.parent_id:
                 parent = await session.get(Task, task.parent_id)
@@ -411,18 +520,39 @@ async def update_task(
                             f"- {task_ref(s)} {s.title} [{s.status}]"
                             + (f": {s.result[:300]}" if s.result else "") for s in siblings
                         )
-                        followups.append(([owner], f"All subtasks of {task_ref(parent)} "
-                                          f"({parent.title}) are closed:\n{lines}", parent.id))
+                        owed_notices.append(([owner], f"All subtasks of {task_ref(parent)} "
+                                          f"({parent.title}) are closed:\n{lines}", parent.id,
+                                          "parent-rollup", task.id))
             # A finished goal: work still open under it is no longer needed. Tell the people
             # on it to stop (their lead can say otherwise), so a team doesn't keep polishing.
             children = (await session.execute(select(Task).where(
                 Task.parent_id == task.id, Task.status.not_in(CLOSED)))).scalars().all()
             for child in children:
                 if child.assignee_id:
-                    followups.append(([child.assignee_id],
+                    owed_notices.append(([child.assignee_id],
                                       f"{ref_s} ({task.title}) is done, so {task_ref(child)} "
                                       f"({child.title}) is no longer needed. Stop work on it, "
-                                      "and cancel it unless it still matters.", child.id))
+                                      "and cancel it unless it still matters.", child.id,
+                                      "child-stop", task.id))
+
+        # ONE COMMIT for the close and the record of what it owes.
+        #
+        # The first version committed the close here and wrote the intents in a second transaction
+        # after the sends (app/services/followups.py) -- which left exactly the window it was meant
+        # to close: a crash in between produced a closed dependency with no durable record, and the
+        # test passed only because it wrote the intent by hand after corrupting the database. A test
+        # that manufactures the state it is supposed to recover is not a test of the recovery.
+        #
+        # So the intent rows are added to THIS session, before the commit below. Either both land or
+        # neither does; "closed with no record" stops being a reachable state.
+        intent_rows = await followups.record_followups(session, org_id, [
+            {"dependency_id": dep_id, "dependent_id": dependent_id,
+             "agent_id": next((t for t in targets if t and t != actor.id), None),
+             "reason": reason, "text": text, "task_id": dependent_id}
+            for targets, text, dependent_id, reason, dep_id in owed_notices
+        ])
+        await session.commit()
+        _ = intent_rows
 
     if comment:
         comment_msg = await comms.post(
@@ -439,9 +569,21 @@ async def update_task(
     for targets, text, wake in notices:
         await comms.notify(org_id, [t for t in targets if t and t != actor.id], text,
                            depth=actor.depth, task_id=task.id, wake=wake)
-    for targets, text, tid in followups:
-        await comms.notify(org_id, [t for t in targets if t and t != actor.id], text,
-                           depth=actor.depth, task_id=tid)
+    # Send the notices the committed transaction recorded as owed.
+    #
+    # The rows already exist (same commit as the close). This loop only delivers, and settles each
+    # row to `sent` or leaves it `created` for the sweep -- never inserts, so a duplicate row cannot
+    # be created here, and a lost race cannot produce a second notice.
+    #
+    # Previously this called record_followups() first and then sent only when the insert had "won",
+    # which meant: if the row already existed (another writer got there first) the notice was never
+    # sent by anyone, and the row sat `created` until a restart. Now the settle step is unconditional
+    # and idempotent: the sweep re-reads status, so a double send is refused there.
+    if owed_notices:
+        for targets, text, dependent_id, reason, dep_id in owed_notices:
+            await followups.deliver_one(org_id, dep_id, dependent_id, reason,
+                                        [t for t in targets if t and t != actor.id],
+                                        text, depth=actor.depth)
     _ = comment_msg
     return task
 

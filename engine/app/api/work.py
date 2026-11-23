@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
 
 from app.core.db import SessionLocal
@@ -120,11 +120,125 @@ async def update_task(task_id: str, body: dict[str, Any] = Body(...)) -> dict[st
     return task_to_dict(t)
 
 
-@router.get("/orgs/{org_id}/artifacts")
-async def list_artifacts(org_id: str) -> list[dict[str, Any]]:
+@router.post("/tasks/{task_id}/claim")
+async def claim_task(task_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Claim a task on behalf of one agent. Operator/supervisor entry point.
+
+    TRUST BOUNDARY: `agentId` comes from the request body, and AccessMiddleware only proves
+    the caller is local or holds the shared access code -- it does not prove which agent is
+    asking. So this route can record a claim attributed to an agent that did not make the
+    call. That is acceptable here because this route exists for an operator acting with the
+    same authority they already have through PATCH (which can set assignee directly), and
+    because it cannot be used to grant permissions the caller lacks: claim_task enforces the
+    org's assign policy and the target agent's own edit scope.
+
+    It is NOT the autonomous path. An agent claiming for itself goes through the
+    `claim_task` tool, where the claimant is ctx.sender and cannot be forged. Treating this
+    HTTP route as proof of "agent X claimed this" would be wrong; the event says who the
+    work belongs to, and the tool is what makes that trustworthy.
+
+    There is deliberately no `force` here. A supervisor who wants to take a held task away
+    reassigns it with PATCH, which is an explicit, auditable reassignment -- not a claim
+    that quietly overrides another agent's ownership.
+
+    409 means someone else holds it. 404 means it does not exist.
+    """
+    agent_ref = body.get("agentId") or body.get("agent")
+    if not agent_ref:
+        raise HTTPException(400, "agentId is required: claiming is an agent action")
     async with SessionLocal() as session:
-        rows = (await session.execute(select(Artifact).where(Artifact.org_id == org_id)
-                                      .order_by(Artifact.created_at.desc()))).scalars().all()
+        t = await session.get(Task, task_id)
+        if t is not None:
+            org_id = t.org_id
+        else:
+            org_id = await _sole_org_id(session)
+            t = await tasks.find_task(session, org_id, task_id)
+        if t is None:
+            raise HTTPException(404, "task not found")
+        from app.services.tasks import _resolve_person
+
+        agent_id = await _resolve_person(session, org_id, str(agent_ref))
+        if agent_id is None:
+            raise HTTPException(404, f"agent '{agent_ref}' not found")
+
+    try:
+        claimed = await tasks.claim_task(org_id, Sender("agent", agent_id), t.id)
+    except tasks.ClaimConflict as e:
+        raise HTTPException(409, str(e)) from None
+    except tasks.TaskError as e:
+        raise HTTPException(400, str(e)) from None
+    return task_to_dict(claimed)
+
+
+@router.post("/orgs/{org_id}/tasks/claim-next")
+async def claim_next_task(org_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Claim the next free task for one agent. Operator entry point; see caveat above."""
+    agent_ref = body.get("agentId") or body.get("agent")
+    if not agent_ref:
+        raise HTTPException(400, "agentId is required: claiming is an agent action")
+    async with SessionLocal() as session:
+        from app.services.tasks import _resolve_person
+
+        agent_id = await _resolve_person(session, org_id, str(agent_ref))
+    if agent_id is None:
+        raise HTTPException(404, f"agent '{agent_ref}' not found")
+
+    try:
+        claimed = await tasks.claim_next(org_id, Sender("agent", agent_id),
+                                         label=body.get("label"))
+    except tasks.ClaimConflict as e:
+        raise HTTPException(409, str(e)) from None
+    if claimed is None:
+        return Response(status_code=204)
+    return task_to_dict(claimed)
+
+
+async def _sole_org_id(session: Any) -> str:
+    """Resolve the one *user* organisation, or refuse when there is more than one.
+
+    This exists only so a caller can name a task by short ref ("T-49") instead of an id on
+    a route that has no org in its path. It must stay a *safe* convenience: with two user
+    organisations, `LIMIT 1` would resolve "T-49" to whichever sorted first and claim a task
+    in an org the caller never named. Two orgs both having a T-49 is the normal case, not a
+    corner case -- task numbers are per-org.
+
+    `kind != 'user'` rows are excluded: Pantheon itself owns a system org (`org_pantheon`)
+    that holds no user tasks, so counting it would make every short ref look ambiguous and
+    break the single-user-org case this exists for.
+    """
+    from sqlalchemy import select as _select
+
+    from app.models import Org as _Org
+
+    rows = (await session.execute(
+        _select(_Org.id).where(_Org.kind == "user").order_by(_Org.id).limit(2))).all()
+    if not rows:
+        raise HTTPException(404, "no organisation")
+    if len(rows) > 1:
+        raise HTTPException(
+            409,
+            "more than one organisation exists; a short task ref is ambiguous. Use "
+            "/orgs/{org_id}/tasks/claim-next, or pass the task's full id instead of a ref.")
+    return str(rows[0][0])
+
+
+@router.get("/orgs/{org_id}/artifacts")
+async def list_artifacts(org_id: str, task_id: str | None = None, turn_id: str | None = None,
+                         path: str | None = None) -> list[dict[str, Any]]:
+    """The versions agents wrote, newest first.
+
+    Filterable because a receipt is a lookup, not a scroll: a verdict names a task (or a Run) and
+    needs the versions bound to it, and "the newest 40 files in the org" cannot answer that.
+    """
+    async with SessionLocal() as session:
+        stmt = select(Artifact).where(Artifact.org_id == org_id)
+        if task_id:
+            stmt = stmt.where(Artifact.task_id == task_id)
+        if turn_id:
+            stmt = stmt.where(Artifact.turn_id == turn_id)
+        if path:
+            stmt = stmt.where(Artifact.path == path)
+        rows = (await session.execute(stmt.order_by(Artifact.created_at.desc()))).scalars().all()
     return [artifact_to_dict(a) for a in rows]
 
 

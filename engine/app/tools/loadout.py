@@ -23,7 +23,13 @@ CORE = frozenset({
     "spawn_subagent", "todo", "load_tools",
 })
 # Also offered whole to someone with colleagues: a team member coordinates on most turns.
-TEAM_CORE = frozenset({"send_message", "create_task", "update_task", "list_tasks", "get_task"})
+# claim_task belongs here because autonomous claiming is the same kind of act as update_task:
+# an agent that has to discover it by name first will not reach for it when it is idle, and
+# will instead poke at the API through the shell looking for a way to take work. That is
+# exactly what happened before it was added -- the tool existed but was never offered, so
+# "an agent can claim work" was true in the schema and false in practice.
+TEAM_CORE = frozenset({"send_message", "create_task", "update_task", "list_tasks", "get_task",
+                       "claim_task"})
 LEAN_ABOVE = 20  # an agent with this many tools or fewer gets them all
 # Tools an agent used in its last this-many calls stay offered from turn to turn. A timed run
 # loaded tools 51 times in 553 calls (stage_check five times in one turn): what was loaded
@@ -66,7 +72,11 @@ def split(org: Any, tools: dict[str, Any], messages: list[BaseMessage],
     """(offered, deferred) tool names for the next model call."""
     if not lean(org) or len(tools) <= LEAN_ABOVE:
         return sorted(t for t in tools if t != "load_tools"), []
-    keep = (CORE | loaded_in(messages) | set(sticky)
+    # TEAM_CORE is part of `keep`. It was defined but never referenced here, so adding a
+    # tool to it changed nothing -- which is how claim_task ended up registered, tested over
+    # HTTP, and still invisible to the agents that needed it. A constant nothing reads is
+    # worse than no constant: it looks like the fix is in place.
+    keep = (CORE | TEAM_CORE | loaded_in(messages) | set(sticky)
             | {n for n, t in tools.items() if getattr(t, "core", False)})
     offered = sorted(t for t in tools if t in keep)
     deferred = sorted(t for t in tools if t not in keep)

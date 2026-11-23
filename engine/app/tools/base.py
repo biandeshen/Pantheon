@@ -187,11 +187,19 @@ def arr(items: dict[str, Any]) -> dict[str, Any]:
 
 
 # Tools every new agent gets by default (all removable).
+# Every agent that can be handed work must be able to TAKE work.
+#
+# `claim_task` was registered, tested over HTTP, and named in loadout.TEAM_CORE as something a team
+# member is always offered -- but it was never in this list, and `loadout.split()` can only keep what
+# the agent already has. So the constant promised a tool the agent never received, and the measured
+# consequence was an agent moving its own task straight to done without claiming it: no `claimed`
+# event, no in_progress transition, and the acceptance check that depends on that flow never firing.
+# Same failure as the one TEAM_CORE's comment describes, one layer lower.
 DEFAULT_TOOLSET: list[dict[str, str]] = [
     {"name": n, "approval": "auto"} for n in (
         "send_message", "post_message", "read_channel", "list_channels", "create_channel",
         "update_channel", "list_colleagues", "list_secrets", "create_task", "update_task",
-        "list_tasks", "get_task",
+        "list_tasks", "get_task", "claim_task",
         "remember", "recall", "request_feature", "hold_meeting",
     )
 ]

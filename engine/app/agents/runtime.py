@@ -121,7 +121,18 @@ class Runtime:
         self._wake.set()
 
     async def _recover(self) -> None:
-        """After a restart: release claims and resume interrupted turns."""
+        """After a restart: release claims, resume interrupted turns, finish owed wake-ups."""
+        # The third part is the one that was missing. A close that committed and then died before its
+        # notice leaves a dependent task waiting forever: measured in production, T-52 closed and T-53
+        # has received nothing since. The intent rows make that gap recoverable instead of permanent.
+        try:
+            from app.services.followups import sweep_followups
+
+            counts = await sweep_followups()
+            if any(counts.values()):
+                log.info("follow-up recovery: %s", counts)
+        except Exception:  # noqa: BLE001 - recovery must not stop the runtime from starting
+            log.exception("follow-up recovery failed; intents stay owed")
         async with SessionLocal() as session:
             await session.execute(update(Delivery).where(Delivery.status == "claimed")
                                   .values(status="pending", lease_until=None))
